@@ -545,6 +545,12 @@ void Gif::draw(Painter &p, const PaintContext &context) const {
 	_smallGroupPart = false;
 
 	ensureDataMediaCreated();
+
+	// AyuGram: transcribe round video messages as soon as they are shown.
+	if (_data->isVideoMessage()) {
+		_data->session().api().transcribes().autoTranscribe(_realParent);
+	}
+
 	const auto item = _parent->data();
 	const auto loaded = dataLoaded();
 	const auto displayLoading = (item->isSending() || _data->displayLoading());
@@ -2647,6 +2653,7 @@ void Gif::ensureTranscribeButton() const {
 		&& !_parent->data()->isScheduled()
 		&& !_parent->data()->isAdminLogEntry()
 		&& (_data->session().premium()
+			|| _data->session().api().transcribes().localAvailable()
 			|| _data->session().api().transcribes().trialsSupport())) {
 		if (!_transcribe) {
 			_transcribe = std::make_unique<TranscribeButton>(

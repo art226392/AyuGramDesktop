@@ -335,6 +335,9 @@ bool TranscribeButton::hasLock() const {
 		return false;
 	}
 	const auto transcribes = &session->api().transcribes();
+	if (!_summarize && transcribes->localAvailable()) {
+		return false;
+	}
 	if (_summarize) {
 		return transcribes->summary(_item).premiumRequired;
 	}
@@ -378,7 +381,9 @@ ClickHandlerPtr TranscribeButton::link() {
 		if (!item) {
 			return;
 		}
-		if (session->premium()) {
+		if (session->premium()
+			|| (!summarize
+				&& session->api().transcribes().localAvailable())) {
 			auto &transcribes = session->api().transcribes();
 			return summarize
 				? transcribes.toggleSummary(item)

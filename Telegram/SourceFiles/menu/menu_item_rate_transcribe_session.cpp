@@ -34,8 +34,8 @@ Fn<void(bool)> RateTranscribeCallbackFactory(
 
 bool HasRateTranscribeItem(not_null<HistoryItem*> item) {
 	const auto &peer = item->history()->peer;
-	if (!peer->session().api().transcribes().entry(
-			item).result.isEmpty()) {
+	const auto &entry = peer->session().api().transcribes().entry(item);
+	if (!entry.local && !entry.result.isEmpty()) {
 		return !peer->session().api().transcribes().isRated(item);
 	}
 	return false;

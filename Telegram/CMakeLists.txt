@@ -223,6 +223,8 @@ set(ayugram_files
         ayu/features/forward/ayu_forward_rich.h
         ayu/features/forward/ayu_sync.cpp
         ayu/features/forward/ayu_sync.h
+        ayu/features/voice_transcribe/voice_transcribe.cpp
+        ayu/features/voice_transcribe/voice_transcribe.h
         ayu/features/translator/ayu_translator.cpp
         ayu/features/translator/ayu_translator.h
         ayu/features/translator/ayu_translate_provider.cpp

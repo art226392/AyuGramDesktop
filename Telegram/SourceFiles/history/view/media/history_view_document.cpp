@@ -512,9 +512,11 @@ QSize Document::countOptimalSize() {
 			|| _realParent->isScheduled()
 			|| _realParent->isAdminLogEntry()
 			|| (!session->premium()
+				&& !transcribes->localAvailable()
 				&& !transcribes->freeFor(_realParent)
 				&& !transcribes->trialsSupport())
 			|| (!session->premium()
+				&& !transcribes->localAvailable()
 				&& _data->duration() > transcribes->trialsMaxLengthMs())) {
 			voice->transcribe = nullptr;
 			voice->transcribeText = {};
@@ -734,6 +736,11 @@ void Document::draw(
 	if (width < st::msgPadding.left() + st::msgPadding.right() + 1) return;
 
 	ensureDataMediaCreated();
+
+	// AyuGram: transcribe voice messages as soon as they are shown.
+	if (_data->isVoiceMessage()) {
+		_data->session().api().transcribes().autoTranscribe(_realParent);
+	}
 
 	const auto cornerDownload = downloadInCorner();
 

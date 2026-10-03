@@ -7,10 +7,20 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+#include "base/weak_ptr.h"
 #include "mtproto/sender.h"
 #include "spellcheck/spellcheck_types.h"
 
 class ApiWrap;
+class DocumentData;
+
+namespace Data {
+class DocumentMedia;
+} // namespace Data
+
+namespace AyuFeatures::VoiceTranscribe {
+struct Result;
+} // namespace AyuFeatures::VoiceTranscribe
 
 namespace Main {
 class Session;
@@ -27,7 +37,7 @@ struct SummaryEntry {
 	mtpRequestId requestId = 0;
 };
 
-class Transcribes final {
+class Transcribes final : public base::has_weak_ptr {
 public:
 	explicit Transcribes(not_null<ApiWrap*> api);
 
@@ -38,11 +48,17 @@ public:
 		bool toolong = false;
 		bool pending = false;
 		bool roundview = false;
+		bool local = false; // AyuGram: own Whisper, not Telegram.
 		mtpRequestId requestId = 0;
 	};
 
 	void toggle(not_null<HistoryItem*> item);
 	[[nodiscard]] const Entry &entry(not_null<HistoryItem*> item) const;
+
+	// AyuGram: voice and round messages through own Whisper key, works
+	// in private chats and without Premium (ayu/features/voice_transcribe).
+	[[nodiscard]] bool localAvailable() const;
+	void autoTranscribe(not_null<HistoryItem*> item);
 
 	void toggleSummary(not_null<HistoryItem*> item);
 	[[nodiscard]] const SummaryEntry &summary(
@@ -64,6 +80,16 @@ private:
 	void load(not_null<HistoryItem*> item);
 	void summarize(not_null<HistoryItem*> item);
 
+	[[nodiscard]] bool canLoadLocal(not_null<HistoryItem*> item) const;
+	void loadLocal(not_null<HistoryItem*> item);
+	[[nodiscard]] bool sendLocal(
+		FullMsgId id,
+		const std::shared_ptr<Data::DocumentMedia> &media);
+	void checkLocalDownloads();
+	void finishLocal(
+		FullMsgId id,
+		const AyuFeatures::VoiceTranscribe::Result &result);
+
 	const not_null<Main::Session*> _session;
 	MTP::Sender _api;
 
@@ -75,6 +101,12 @@ private:
 	base::flat_map<uint64, FullMsgId> _ids;
 
 	base::flat_map<FullMsgId, SummaryEntry> _summaries;
+
+	base::flat_map<
+		FullMsgId,
+		std::shared_ptr<Data::DocumentMedia>> _localDownloads;
+	base::flat_set<FullMsgId> _autoRequested;
+	rpl::lifetime _localDownloadsLifetime;
 
 };
 

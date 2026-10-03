@@ -92,6 +92,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "spellcheck/spellcheck_highlight_syntax.h"
 
 // AyuGram includes
+#include "api/api_transcribes.h"
 #include "ayu/ayu_settings.h"
 #include "ayu/data/messages_storage.h"
 #include "ayu/features/filters/filters_controller.h"
@@ -2000,6 +2001,11 @@ rpl::producer<not_null<const ViewElement*>> Session::viewLayoutChanged() const {
 
 void Session::notifyNewItemAdded(not_null<HistoryItem*> item) {
 	_newItemAdded.fire_copy(item);
+
+	// AyuGram: transcribe incoming voice right away, even in a closed chat.
+	if (!item->out()) {
+		session().api().transcribes().autoTranscribe(item);
+	}
 }
 
 rpl::producer<not_null<HistoryItem*>> Session::newItemAdded() const {

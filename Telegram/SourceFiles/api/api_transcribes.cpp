@@ -22,11 +22,69 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session_settings.h"
 #include "spellcheck/spellcheck_types.h"
 
+// AyuGram includes
+#include "ayu/features/voice_transcribe/voice_transcribe.h"
+#include "data/data_document_media.h"
+#include "data/data_file_origin.h"
+#include "data/data_media_types.h"
+
+#include <QtCore/QFile>
+
 namespace Api {
+namespace {
+
+namespace Voice = AyuFeatures::VoiceTranscribe;
+
+// Not a real MTP request: marks "own Whisper request in flight", so the
+// existing UI shows the loading state and toggle() waits for the answer.
+constexpr auto kLocalRequestId = mtpRequestId(-1);
+
+[[nodiscard]] DocumentData *VoiceDocument(not_null<HistoryItem*> item) {
+	const auto media = item->media();
+	const auto document = media ? media->document() : nullptr;
+	return (document
+		&& !media->ttlSeconds()
+		&& (document->isVoiceMessage() || document->isVideoMessage()))
+		? document
+		: nullptr;
+}
+
+[[nodiscard]] QByteArray ReadVoiceBytes(
+		const std::shared_ptr<Data::DocumentMedia> &media) {
+	auto result = media->bytes();
+	if (result.isEmpty()) {
+		const auto path = media->owner()->filepath(true);
+		if (!path.isEmpty()) {
+			auto file = QFile(path);
+			if (file.open(QIODevice::ReadOnly)) {
+				result = file.readAll();
+			}
+		}
+	}
+	return result;
+}
+
+[[nodiscard]] QString VoiceFileName(not_null<DocumentData*> document) {
+	const auto mime = document->mimeString().toLower();
+	return document->isVideoMessage()
+		? u"round.mp4"_q
+		: mime.contains(u"mpeg"_q)
+		? u"voice.mp3"_q
+		: (mime.contains(u"mp4"_q) || mime.contains(u"m4a"_q))
+		? u"voice.m4a"_q
+		: mime.contains(u"wav"_q)
+		? u"voice.wav"_q
+		: u"voice.ogg"_q;
+}
+
+} // namespace
 
 Transcribes::Transcribes(not_null<ApiWrap*> api)
 : _session(&api->session())
 , _api(&api->instance()) {
+	// Reads the config now, so log.txt tells right away whether own
+	// transcription is on (AYU_VOICE.cmd checks it after install).
+	[[maybe_unused]] const auto available = Voice::Available();
 }
 
 bool Transcribes::isRated(not_null<HistoryItem*> item) const {
@@ -105,7 +163,18 @@ void Transcribes::toggle(not_null<HistoryItem*> item) {
 	const auto id = item->fullId();
 	auto i = _map.find(id);
 	if (i == _map.end()) {
-		load(item);
+		if (canLoadLocal(item)) {
+			loadLocal(item);
+		} else {
+			load(item);
+		}
+		_session->data().requestItemResize(item);
+	} else if (i->second.local
+		&& i->second.failed
+		&& !i->second.toolong
+		&& canLoadLocal(item)) {
+		// AyuGram: a click on a failed own transcription retries it.
+		loadLocal(item);
 		_session->data().requestItemResize(item);
 	} else if (!i->second.requestId) {
 		i->second.shown = !i->second.shown;
@@ -304,6 +373,144 @@ void Transcribes::checkSummaryToTranslate(FullMsgId id) {
 		i->second.result = tr::lng_contacts_loading(tr::now, tr::italic);
 		summarize(item);
 	}
+}
+
+bool Transcribes::localAvailable() const {
+	return Voice::Available();
+}
+
+bool Transcribes::canLoadLocal(not_null<HistoryItem*> item) const {
+	return localAvailable()
+		&& item->isHistoryEntry()
+		&& !item->isLocal()
+		&& !item->isScheduled()
+		&& VoiceDocument(item);
+}
+
+void Transcribes::autoTranscribe(not_null<HistoryItem*> item) {
+	if (!Voice::AutoTranscribe()) {
+		return;
+	}
+	const auto id = item->fullId();
+	if (_autoRequested.contains(id) || _map.contains(id)) {
+		return;
+	}
+	_autoRequested.insert(id);
+	if (!canLoadLocal(item)) {
+		return;
+	}
+	// Called from paint and from new message notifications, so the actual
+	// work (and the resize it causes) is postponed out of that stack.
+	crl::on_main(this, [=] {
+		const auto item = _session->data().message(id);
+		if (item && !_map.contains(id) && canLoadLocal(item)) {
+			loadLocal(item);
+			_session->data().requestItemResize(item);
+		}
+	});
+}
+
+void Transcribes::loadLocal(not_null<HistoryItem*> item) {
+	const auto document = VoiceDocument(item);
+	if (!document) {
+		return;
+	}
+	const auto id = item->fullId();
+	auto &entry = _map.emplace(id).first->second;
+	entry.requestId = kLocalRequestId;
+	entry.shown = true;
+	entry.failed = false;
+	entry.toolong = false;
+	entry.pending = false;
+	entry.local = true;
+
+	auto media = document->createMediaView();
+	if (sendLocal(id, media)) {
+		return;
+	}
+	if (_localDownloads.empty()) {
+		_session->downloaderTaskFinished(
+		) | rpl::on_next([=] {
+			checkLocalDownloads();
+		}, _localDownloadsLifetime);
+	}
+	_localDownloads[id] = std::move(media);
+	document->save(Data::FileOrigin(id), QString());
+	checkLocalDownloads();
+}
+
+bool Transcribes::sendLocal(
+		FullMsgId id,
+		const std::shared_ptr<Data::DocumentMedia> &media) {
+	auto bytes = ReadVoiceBytes(media);
+	if (bytes.isEmpty()) {
+		return false;
+	}
+	const auto document = media->owner();
+	Voice::Transcribe(
+		std::move(bytes),
+		VoiceFileName(document),
+		crl::guard(this, [=](Voice::Result result) {
+			finishLocal(id, result);
+		}));
+	return true;
+}
+
+void Transcribes::checkLocalDownloads() {
+	auto failed = std::vector<FullMsgId>();
+	for (auto i = _localDownloads.begin(); i != _localDownloads.end();) {
+		const auto id = i->first;
+		const auto media = i->second;
+		if (sendLocal(id, media)) {
+			i = _localDownloads.erase(i);
+		} else if (!media->owner()->loading()) {
+			// Download finished without data or was cancelled.
+			failed.push_back(id);
+			i = _localDownloads.erase(i);
+		} else {
+			++i;
+		}
+	}
+	if (_localDownloads.empty()) {
+		_localDownloadsLifetime.destroy();
+	}
+	for (const auto &id : failed) {
+		finishLocal(id, { .error = Voice::Error::Failed });
+	}
+}
+
+void Transcribes::finishLocal(FullMsgId id, const Voice::Result &result) {
+	const auto i = _map.find(id);
+	if (i == _map.end() || i->second.requestId != kLocalRequestId) {
+		return;
+	}
+	const auto item = _session->data().message(id);
+	if (result.error == Voice::Error::Failed && item && _session->premium()) {
+		// Own key failed, Premium transcription still works.
+		_map.erase(i);
+		load(item);
+		_session->data().requestItemResize(item);
+		return;
+	}
+	auto &entry = i->second;
+	entry.requestId = 0;
+	entry.pending = false;
+	entry.failed = (result.error != Voice::Error::None);
+	entry.toolong = (result.error == Voice::Error::TooLong);
+	entry.result = entry.failed
+		? QString()
+		: result.text.isEmpty()
+		? QString::fromUtf8("\xF0\x9F\x94\x87") // muted speaker, no speech
+		: result.text;
+	if (!item) {
+		return;
+	}
+	if (const auto document = VoiceDocument(item)
+		; document && document->isVideoMessage()) {
+		entry.roundview = true;
+		_session->data().requestItemViewRefresh(item);
+	}
+	_session->data().requestItemResize(item);
 }
 
 } // namespace Api
