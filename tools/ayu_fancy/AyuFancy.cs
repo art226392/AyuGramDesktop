@@ -591,24 +591,83 @@ public static class Core {
 		return new Tagged(value, Canonical(canonical, size));
 	}
 
-	public static string BuildPrompt(string html, string extra) {
+	// Few-shot: small fast models copy the look of the examples much better
+	// than they follow abstract rules.
+	public static string BuildPrompt(string html, string extra, bool bolder) {
 		var result = new StringBuilder();
-		result.Append("You format Telegram messages. Rewrite the message below as one beautifully formatted Telegram message.\n\n");
-		result.Append("Rules:\n");
-		result.Append("- Keep the author's language, voice, slang, profanity and meaning. Do not translate, censor, summarize, shorten, or add facts, greetings, signatures, hashtags or questions.\n");
-		result.Append("- Fix only obvious typos and punctuation.\n");
-		result.Append("- Make it easy to scan: short paragraphs with an empty line between them; <b>bold</b> for the key idea and key words; <i>italic</i> for nuance; <u>underline</u> rarely; <s>strike</s> for a self-correction joke; <tg-spoiler>spoiler</tg-spoiler> for a punchline or a spoiler; <code>code</code> for commands, numbers to copy, file names; <pre>...</pre> for multi-line code; <blockquote>...</blockquote> for quotes; <a href=\"...\">text</a> keeps existing links.\n");
-		result.Append("- Lists: one item per line, each line starts with \"\u2022 \" or one fitting emoji. Never use <ul>, <ol>, <li>, <h1>-<h6>, <p>, <div>, tables or images.\n");
-		result.Append("- Emoji: at most one per paragraph and only where natural; none in formal or sad text.\n");
-		result.Append("- A short message (one or two sentences) stays short: only add emphasis.\n");
-		result.Append("- Tokens like \u27E61\u27E7 are custom emoji or mentions: copy each one exactly once, unchanged, at the same place.\n");
-		result.Append("- Line breaks only as <br>; an empty line is <br><br>.\n");
-		result.Append("- Answer with the formatted message only: no explanations, no ``` fences, no <<< >>> markers. Do not run any commands or tools.\n");
-		if (!string.IsNullOrWhiteSpace(extra)) {
-			result.Append("- Extra wishes of the author: " + extra.Trim() + "\n");
+		result.Append("You are a top Telegram channel editor. Turn the author's message into a creative, aesthetic, eye-catching Telegram message that still sounds like the author.\n\n");
+		result.Append("Style:\n");
+		result.Append("- Open with a hook: the main idea in <b>bold</b> with one fitting emoji at the start of the first line.\n");
+		result.Append("- Break the text into short airy blocks with an empty line (<br><br>) between them.\n");
+		result.Append("- <b>Bold</b> the key words, times, dates, prices, names; <i>italic</i> for tone and asides; <u>underline</u> for a must-not-miss detail.\n");
+		result.Append("- Two or more parallel points become a list: one point per line, each starting with a fitting emoji (✅ \U0001F539 ▫️ \U0001F4CC ⚡ and the like), no <ul>/<li>.\n");
+		result.Append("- The strongest phrase or a quote goes into <blockquote>...</blockquote>; a joke, punchline or surprise into <tg-spoiler>...</tg-spoiler>.\n");
+		result.Append("- <code>...</code> only for things to copy: commands, codes, numbers, addresses. Keep existing links as <a href=\"...\">text</a>.\n");
+		result.Append("- 2-6 emoji in total, placed meaningfully, never at the end of every line. A very short message gets one emoji and one bold accent, no list, no quote.\n");
+		result.Append("- Never wrap the whole message in one style; formatting must make it easier to read, not louder.\n\n");
+		result.Append("Content rules:\n");
+		result.Append("- Same language, voice, slang and profanity as the author. You may reorder and lightly rephrase for rhythm, fix typos and punctuation.\n");
+		result.Append("- Never invent facts, numbers, names, links, greetings, signatures, hashtags or calls to action that are not in the message.\n");
+		result.Append("- Tokens like ⟦1⟧ are custom emoji or mentions: copy each exactly once, unchanged, near its original place.\n");
+		result.Append("- Output Telegram HTML only: <b> <i> <u> <s> <tg-spoiler> <code> <pre> <blockquote> <a href> <br>. Line breaks only as <br>.\n");
+		result.Append("- Answer with the formatted message only: no explanations, no ``` fences, no <<< >>> markers. Do not run any commands or tools.\n\n");
+		result.Append("Example 1\nMessage:\n<<<\nребята завтра созвон в 19:00 по проекту, надо обсудить дизайн новый бюджет и сроки, ссылка будет в чате не опаздывайте пж\n>>>\nAnswer:\n");
+		result.Append("\U0001F4C5 <b>Завтра созвон по проекту</b> в <b>19:00</b><br><br>Обсуждаем:<br>\U0001F3A8 новый дизайн<br>\U0001F4B0 бюджет<br>⏳ сроки<br><br>\U0001F517 Ссылка будет в чате<br><blockquote>Не опаздывайте, пж \U0001F64F</blockquote>\n\n");
+		result.Append("Example 2\nMessage:\n<<<\nкороче я вчера наконец доделал бота, теперь он сам режет видео в кружки за 10 секунд. осталось только починить звук, но это мелочи\n>>>\nAnswer:\n");
+		result.Append("\U0001F680 <b>Короче, я наконец доделал бота!</b><br><br>Теперь он сам режет видео в кружки <b>за 10 секунд</b> ⚡<br><br>Осталось только починить звук, <i>но это мелочи</i> <tg-spoiler>(наверное \U0001F605)</tg-spoiler>\n\n");
+		result.Append("Example 3\nMessage:\n<<<\nок давай\n>>>\nAnswer:\n\U0001F44C <b>Ок, давай!</b>\n\n");
+		if (bolder) {
+			result.Append("Your previous answer was too plain. Be bolder and more creative this time: clear hook, structure, emoji, at least three kinds of formatting where the text allows it.\n\n");
 		}
-		result.Append("\nMessage (HTML):\n<<<\n" + html + "\n>>>\n");
+		if (!string.IsNullOrWhiteSpace(extra)) {
+			result.Append("Author's own wishes for the style: " + extra.Trim() + "\n\n");
+		}
+		result.Append("Now the real message.\nMessage:\n<<<\n" + html + "\n>>>\nAnswer:\n");
 		return result.ToString();
+	}
+
+	public static string BuildPrompt(string html, string extra) {
+		return BuildPrompt(html, extra, false);
+	}
+
+	static int CountEmoji(string text) {
+		var result = 0;
+		for (var i = 0; i < text.Length; ++i) {
+			var code = char.IsSurrogatePair(text, i) ? char.ConvertToUtf32(text, i) : text[i];
+			if ((code >= 0x1F300 && code <= 0x1FAFF) || (code >= 0x2600 && code <= 0x27BF) || (code >= 0x2B00 && code <= 0x2BFF) || code == 0x2328 || code == 0x23F3 || code == 0x231B) {
+				++result;
+			}
+			if (code > 0xFFFF) ++i;
+		}
+		return result;
+	}
+
+	// How much the answer is really formatted: kinds of formatting, emoji,
+	// structure. A whole message in one style counts as plain.
+	public static int Score(Tagged original, Tagged result) {
+		var size = Math.Max(1, result.Text.Length);
+		var kinds = new HashSet<string>();
+		var covered = new bool[result.Text.Length];
+		foreach (var tag in result.Tags) {
+			foreach (var part in SplitTags(tag.Id)) {
+				if (IsProtectedPart(part)) continue;
+				kinds.Add(part.StartsWith(Pre, StringComparison.Ordinal) ? Pre : IsLinkPart(part) ? "link" : part);
+				for (var k = tag.Offset; k < Math.Min(tag.Offset + tag.Length, covered.Length); ++k) covered[k] = true;
+			}
+		}
+		var coverage = covered.Count(c => c) / (double)size;
+		var score = kinds.Count * 2;
+		score += Math.Min(4, Math.Max(0, CountEmoji(result.Text) - CountEmoji(original.Text)));
+		var lines = result.Text.Count(c => c == '\n') - original.Text.Count(c => c == '\n');
+		if (lines > 0) score += 2;
+		if (coverage > 0.9) score -= 4;
+		return score;
+	}
+
+	// The bar a good answer should pass, lower for short messages.
+	public static int GoodScore(Tagged original) {
+		var visible = CountVisible(original.Text);
+		return visible < 25 ? 3 : visible < 80 ? 5 : 7;
 	}
 
 	public static bool LooksSane(Tagged original, Tagged result) {
@@ -1052,28 +1111,90 @@ public static class Engines {
 	}
 
 	// Whole pipeline for one piece of field text.
+	class Candidate {
+		public Answer Answer;
+		public Tagged Text;
+		public int Lost;
+		public int Score;
+	}
+
+	// Asks every engine there is, waits a little for the slower one after
+	// the first good answer, returns all answers that came.
+	public static List<Answer> AskAll(Config config, string prompt, int graceMs) {
+		var codex = config.Engine != "groq" ? FindCodex(config) : null;
+		var chat = config.Engine != "codex" && !string.IsNullOrEmpty(config.Key);
+		var asks = new List<Func<Answer>>();
+		if (chat) asks.Add(() => AskChat(config, config.Model, prompt));
+		if (codex != null) asks.Add(() => AskCodex(config, codex, prompt));
+		var answers = new List<Answer>();
+		if (asks.Count == 0) {
+			answers.Add(new Answer { Error = config.Engine == "codex" ? "Codex не найден, запусти AYU_FANCY.cmd" : "Нет ни Codex, ни ключа Groq, запусти AYU_FANCY.cmd" });
+			return answers;
+		}
+		var gate = new object();
+		var pending = asks.Count;
+		var firstGood = new ManualResetEvent(false);
+		var all = new ManualResetEvent(false);
+		foreach (var ask in asks) {
+			var call = ask;
+			var thread = new Thread(() => {
+				Answer answer;
+				try { answer = call(); } catch (Exception e) { answer = new Answer { Error = e.Message }; }
+				lock (gate) {
+					answers.Add(answer);
+					if (answer.Error.Length == 0 && answer.Text.Length > 0) firstGood.Set();
+					if (--pending == 0) { firstGood.Set(); all.Set(); }
+				}
+			});
+			thread.IsBackground = true;
+			thread.Start();
+		}
+		firstGood.WaitOne();
+		all.WaitOne(graceMs);
+		lock (gate) {
+			return answers.ToList();
+		}
+	}
+
 	public static Result Format(Config config, Tagged source) {
 		var result = new Result();
 		var watch = Stopwatch.StartNew();
 		var items = new List<Protected>();
 		var prepared = Core.Protect(source, items);
-		var prompt = Core.BuildPrompt(Core.ToHtml(prepared), config.Style);
-		var answer = Ask(config, prompt);
-		result.Engine = answer.Engine;
-		result.Raw = answer.Text;
+		var html = Core.ToHtml(prepared);
+		var good = Core.GoodScore(source);
+		Candidate best = null;
+		var errors = new List<string>();
+		for (var attempt = 0; attempt < 2; ++attempt) {
+			var answers = AskAll(config, Core.BuildPrompt(html, config.Style, attempt > 0), 2000);
+			foreach (var answer in answers) {
+				if (answer.Error.Length > 0) {
+					errors.Add(answer.Error);
+					continue;
+				}
+				int lost;
+				var restored = Core.Restore(Core.FromHtml(Core.CleanAnswer(answer.Text)), items, out lost);
+				if (!Core.LooksSane(source, restored)) {
+					errors.Add(answer.Engine + " вернул что-то не то");
+					continue;
+				}
+				var candidate = new Candidate { Answer = answer, Text = restored, Lost = lost, Score = Core.Score(source, restored) - lost * 3 };
+				Log.Write(answer.Engine + " score " + candidate.Score + " (good " + good + ")");
+				if (best == null || candidate.Score > best.Score) best = candidate;
+			}
+			// One more try only when everything was plain and there is time.
+			if (best != null && (best.Score >= good || watch.ElapsedMilliseconds > 6000)) break;
+			if (best == null && errors.Count > 0 && attempt == 0 && errors.All(e => e.Contains("не найден") || e.Contains("Нет ни"))) break;
+		}
 		result.Milliseconds = watch.ElapsedMilliseconds;
-		if (answer.Error.Length > 0) {
-			result.Error = answer.Error;
+		if (best == null) {
+			result.Error = errors.Count > 0 ? string.Join("; ", errors.Distinct()) : "нет ответа";
 			return result;
 		}
-		int lost;
-		var restored = Core.Restore(Core.FromHtml(Core.CleanAnswer(answer.Text)), items, out lost);
-		if (!Core.LooksSane(source, restored)) {
-			result.Error = answer.Engine + " вернул что-то не то, текст не тронут";
-			return result;
-		}
-		result.Text = restored;
-		result.Lost = lost;
+		result.Engine = best.Answer.Engine;
+		result.Raw = best.Answer.Text;
+		result.Text = best.Text;
+		result.Lost = best.Lost;
 		return result;
 	}
 }
