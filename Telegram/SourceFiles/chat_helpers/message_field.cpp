@@ -67,6 +67,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <QtWidgets/QApplication>
 
 // AyuGram includes
+#include "ayu/features/fancy_format/fancy_format.h"
 #include "ayu/features/forward/ayu_forward.h"
 
 
@@ -534,6 +535,9 @@ auto InitMessageFieldHandlers(MessageFieldHandlersArgs &&args)
 	};
 	const auto field = args.field;
 	const auto session = args.session;
+	// Polls, todo lists and the rich editor allow only some tags.
+	const auto fancyFormat = args.allowMarkdownTags.empty()
+		&& !args.linkValidator;
 	field->setTagMimeProcessor(
 		FieldTagMimeProcessor(session, args.allowPremiumEmoji));
 	field->setCustomTextContext(Core::TextContext({
@@ -562,6 +566,9 @@ auto InitMessageFieldHandlers(MessageFieldHandlersArgs &&args)
 				args.linkValidator));
 		field->setEditLanguageCallback(DefaultEditLanguageCallback(show));
 		InitSpellchecker(show, field, args.fieldStyle != nullptr);
+		if (fancyFormat) {
+			AyuFeatures::FancyFormat::SetupField(show, field);
+		}
 	}
 	const auto style = std::make_shared<Ui::ChatStyle>(
 		session->colorIndicesValue());

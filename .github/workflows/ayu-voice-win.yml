@@ -258,7 +258,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          NOTES="AyuGram с авто-расшифровкой голосовых и кружков (Whisper). Коммит ${GITHUB_SHA}, ветка ${GITHUB_REF_NAME}. Ставится через AYU_VOICE.cmd."
+          NOTES="AyuGram: авто-расшифровка голосовых и кружков (Whisper), красивое оформление сообщений через Codex (Ctrl+Shift+F). Коммит ${GITHUB_SHA}, ветка ${GITHUB_REF_NAME}. Ставится через AYU_VOICE.cmd."
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --prerelease --title "AyuGram voice" --notes "$NOTES"
           else
