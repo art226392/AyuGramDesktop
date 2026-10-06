@@ -389,6 +389,10 @@ public static class Core {
 	// runs collapse to one space, <br> and blocks make line breaks, <pre> keeps
 	// everything as is.
 	public static Tagged FromHtml(string html) {
+		return FromHtml(html, true);
+	}
+
+	public static Tagged FromHtml(string html, bool boldHeadings) {
 		var text = new StringBuilder();
 		var tags = new List<Tag>();
 		var stack = new List<Element>();
@@ -491,7 +495,8 @@ public static class Core {
 				pendingBreak = false;
 			}
 			var created = new Element { Name = name, Block = block };
-			if (name == "b" || name == "strong" || (name.Length == 2 && name[0] == 'h' && char.IsDigit(name[1]))) {
+			var heading = name.Length == 2 && name[0] == 'h' && char.IsDigit(name[1]);
+			if (name == "b" || name == "strong" || (heading && boldHeadings)) {
 				created.TagId = Bold;
 			} else if (name == "i" || name == "em" || name == "cite") {
 				created.TagId = Italic;
@@ -630,6 +635,81 @@ public static class Core {
 		return BuildPrompt(html, extra, false);
 	}
 
+	// Clean mode: a careful copy editor, not a designer.
+	public static string BuildCleanPrompt(string html, string extra) {
+		var result = new StringBuilder();
+		result.Append("You are a careful copy editor for Telegram messages. Return the same message, cleaned up:\n");
+		result.Append("- Correct capitalization and punctuation: commas, periods, question marks, dashes, «» quotes for Russian. Fix obvious typos.\n");
+		result.Append("- Readable whitespace: split a long message into short paragraphs with an empty line (<br><br>) between them.\n");
+		result.Append("- <i>Italics</i> sparingly, only where emphasis, a term, a title or an aside really fits.\n");
+		result.Append("- Only a long message with clearly different parts gets headings: <h1>, <h2>, <h3> on their own lines.\n");
+		result.Append("- No bold, no emoji, no lists unless the author already enumerates, no underline, no spoilers.\n");
+		result.Append("- Keep every word, the order, the author's voice, slang and profanity. Do not rephrase, shorten, add or translate anything.\n");
+		result.Append("- Keep links as <a href=\"...\">text</a>, commands and codes as <code>...</code>. Tokens like \u27E61\u27E7 are custom emoji or mentions: copy each unchanged.\n");
+		result.Append("- Output Telegram HTML only (<i> <h1> <h2> <h3> <code> <a> <br>), the message only, no explanations, no ``` fences. Do not run any commands or tools.\n");
+		if (!string.IsNullOrWhiteSpace(extra)) {
+			result.Append("- Author's own wishes: " + extra.Trim() + "\n");
+		}
+		result.Append("\nExample\nMessage:\n<<<\nкороче я вчера доделал бота он теперь сам режет видео в кружки осталось звук починить но это мелочи\n>>>\nAnswer:\nКороче, я вчера доделал бота: он теперь сам режет видео в кружки.<br><br>Осталось звук починить, <i>но это мелочи</i>.\n\n");
+		result.Append("Now the real message.\nMessage:\n<<<\n" + html + "\n>>>\nAnswer:\n");
+		return result.ToString();
+	}
+
+	static bool IsEmojiCode(int code) {
+		return (code >= 0x1F300 && code <= 0x1FAFF) || (code >= 0x2600 && code <= 0x27BF)
+			|| (code >= 0x2B00 && code <= 0x2BFF) || code == 0xFE0F || code == 0x200D
+			|| (code >= 0x1F1E6 && code <= 0x1F1FF);
+	}
+
+	// Clean mode guarantees: no bold and no emoji the author did not type,
+	// whatever the model did. Tags follow the removed characters.
+	public static Tagged Enforce(Tagged original, Tagged result) {
+		var allowed = new HashSet<int>();
+		for (var i = 0; i < original.Text.Length; ++i) {
+			var code = char.IsSurrogatePair(original.Text, i) ? char.ConvertToUtf32(original.Text, i) : original.Text[i];
+			if (IsEmojiCode(code)) allowed.Add(code);
+			if (code > 0xFFFF) ++i;
+		}
+		var text = result.Text;
+		var map = new int[text.Length + 1];
+		var output = new StringBuilder();
+		for (var i = 0; i < text.Length; ) {
+			var pair = char.IsSurrogatePair(text, i);
+			var code = pair ? char.ConvertToUtf32(text, i) : text[i];
+			var width = pair ? 2 : 1;
+			var drop = IsEmojiCode(code) && !allowed.Contains(code);
+			if (drop) {
+				// The space before a removed emoji goes too when punctuation,
+				// a space or the line end follows.
+				var next = i + width < text.Length ? text[i + width] : '\n';
+				if (output.Length > 0 && output[output.Length - 1] == ' '
+					&& (char.IsPunctuation(next) || char.IsWhiteSpace(next))) {
+					output.Length -= 1;
+				}
+			}
+			for (var k = 0; k < width; ++k) map[i + k] = output.Length;
+			if (!drop) output.Append(text, i, width);
+			i += width;
+		}
+		map[text.Length] = output.Length;
+		var cleaned = Regex.Replace(output.ToString(), "[ \\t]{2,}", " ");
+		if (cleaned.Length != output.Length) {
+			// Rare: collapsing spaces after a removed emoji; keep tags simple.
+			cleaned = output.ToString();
+		}
+		var tags = new List<Tag>();
+		foreach (var tag in result.Tags) {
+			var parts = SplitTags(tag.Id).Where(p => p != Bold).ToList();
+			if (parts.Count == 0) continue;
+			var from = map[Math.Min(tag.Offset, text.Length)];
+			var till = map[Math.Min(tag.Offset + tag.Length, text.Length)];
+			if (till > from) tags.Add(new Tag(from, till - from, JoinTags(parts)));
+		}
+		var value = cleaned;
+		var trimmed = value.TrimEnd();
+		return new Tagged(trimmed, Canonical(tags.Where(t => t.Offset < trimmed.Length).Select(t => new Tag(t.Offset, Math.Min(t.Length, trimmed.Length - t.Offset), t.Id)).ToList(), trimmed.Length));
+	}
+
 	static int CountEmoji(string text) {
 		var result = 0;
 		for (var i = 0; i < text.Length; ++i) {
@@ -760,13 +840,19 @@ public class Config {
 	public bool Enabled = true;
 	public string Engine = "auto";
 	public string CodexPath = "";
-	public string CodexModel = "";
-	public string CodexEffort = "low";
+	public string CodexModel = "gpt-6.1-terra";
+	public string CodexEffort = "medium";
 	public bool CodexUserConfig = false;
 	public string Key = "";
 	public string BaseUrl = "https://api.groq.com/openai/v1";
 	public string Model = "openai/gpt-oss-120b";
 	public string Style = "";
+	// "clean": capitals, punctuation, italics, paragraphs and headings, no bold
+	// and no emoji (default); "fancy": the creative channel look.
+	public string Mode = "clean";
+	// Enter in AyuGram formats the message first, then sends it.
+	public bool OnEnter = true;
+	public int EnterTimeout = 25;
 	public bool Button = true;
 	// Button position from the bottom right corner of the AyuGram window,
 	// in pixels at 100% scale: just above the send button by default.
@@ -814,6 +900,10 @@ public class Config {
 					result.Model = Str(json, "model", result.Model);
 					result.Style = Str(json, "style", result.Style);
 					result.Button = Bool(json, "button", true);
+					result.Mode = Str(json, "mode", result.Mode).ToLowerInvariant();
+					result.OnEnter = Bool(json, "on_enter", true);
+					object timeout;
+					if (json.TryGetValue("enter_timeout", out timeout) && timeout is int) result.EnterTimeout = Math.Max(3, (int)timeout);
 					object number;
 					if (json.TryGetValue("button_right", out number) && number is int) result.ButtonRight = (int)number;
 					if (json.TryGetValue("button_bottom", out number) && number is int) result.ButtonBottom = (int)number;
@@ -1123,6 +1213,45 @@ public static class Engines {
 	}
 
 	// Whole pipeline for one piece of field text.
+	public static Result FormatClean(Config config, Tagged source) {
+		var result = new Result();
+		var watch = Stopwatch.StartNew();
+		var items = new List<Protected>();
+		var prepared = Core.Protect(source, items);
+		var prompt = Core.BuildCleanPrompt(Core.ToHtml(prepared), config.Style);
+		Tagged best = null;
+		var errors = new List<string>();
+		// The chosen Codex model answers; Groq only when Codex is missing or failed.
+		var answers = new List<Answer>();
+		var codex = config.Engine != "groq" ? FindCodex(config) : null;
+		if (codex != null) answers.Add(AskCodex(config, codex, prompt));
+		if ((codex == null || answers[0].Error.Length > 0) && config.Engine != "codex" && !string.IsNullOrEmpty(config.Key)) {
+			answers.Add(AskChat(config, config.Model, prompt));
+		}
+		if (answers.Count == 0) answers.Add(new Answer { Error = "Нет ни Codex, ни ключа Groq, запусти AYU_FANCY.cmd" });
+		foreach (var answer in answers) {
+			if (answer.Error.Length > 0) { errors.Add(answer.Error); continue; }
+			int lost;
+			// A heading gets an empty line under it, it can't be bold here.
+			var html = Regex.Replace(Core.CleanAnswer(answer.Text), "(</h[1-6]>)(?!\\s*<br)", "$1<br>", RegexOptions.IgnoreCase);
+			var restored = Core.Restore(Core.FromHtml(html, false), items, out lost);
+			restored = Core.Enforce(source, restored);
+			if (!Core.LooksSane(source, restored)) { errors.Add(answer.Engine + " вернул что-то не то"); continue; }
+			best = restored;
+			result.Engine = answer.Engine;
+			result.Raw = answer.Text;
+			result.Lost = lost;
+			break;
+		}
+		result.Milliseconds = watch.ElapsedMilliseconds;
+		if (best == null) {
+			result.Error = errors.Count > 0 ? string.Join("; ", errors.Distinct()) : "нет ответа";
+			return result;
+		}
+		result.Text = best;
+		return result;
+	}
+
 	class Candidate {
 		public Answer Answer;
 		public Tagged Text;
@@ -1170,6 +1299,9 @@ public static class Engines {
 	}
 
 	public static Result Format(Config config, Tagged source) {
+		if (config.Mode != "fancy") {
+			return FormatClean(config, source);
+		}
 		var result = new Result();
 		var watch = Stopwatch.StartNew();
 		var items = new List<Protected>();
@@ -1328,6 +1460,13 @@ public static class Native {
 	public const int VK_LWIN = 0x5B;
 	public const int VK_RWIN = 0x5C;
 	public const int VK_F = 0x46;
+	public const int VK_RETURN = 0x0D;
+	public const int VK_ESCAPE = 0x1B;
+
+	public static void Tap(int key) {
+		keybd_event((byte)key, 0, 0, UIntPtr.Zero);
+		keybd_event((byte)key, 0, 2, UIntPtr.Zero);
+	}
 
 	public static bool Down(int key) {
 		return (GetAsyncKeyState(key) & 0x8000) != 0;
@@ -1484,11 +1623,14 @@ public class TrayApp : ApplicationContext {
 			ContextMenuStrip = new ContextMenuStrip(),
 		};
 		_tray.ContextMenuStrip.Items.Add("\u2728 Кнопка у отправки или Ctrl+Shift+F в AyuGram").Enabled = false;
+		var onEnter = new ToolStripMenuItem("Оформлять при отправке (Enter)") { CheckOnClick = true, Checked = Config.Load().OnEnter };
+		onEnter.CheckedChanged += (s, e) => SaveSetting("on_enter", onEnter.Checked);
+		_tray.ContextMenuStrip.Items.Add(onEnter);
 		_tray.ContextMenuStrip.Items.Add("Настройки", null, (s, e) => OpenFile("ayu_fancy.json"));
 		_tray.ContextMenuStrip.Items.Add("Лог", null, (s, e) => OpenFile("ayu_fancy.log"));
 		_tray.ContextMenuStrip.Items.Add("Выход", null, (s, e) => ExitThread());
 		_button = new SparkButton();
-		_button.Clicked = () => StartRun(_target, false);
+		_button.Clicked = () => StartRun(_target, Trigger.Button);
 		_button.Moved = SaveButtonPlace;
 		_follow = new System.Windows.Forms.Timer { Interval = 150 };
 		_follow.Tick += (s, e) => Follow();
@@ -1549,6 +1691,24 @@ public class TrayApp : ApplicationContext {
 			var key = Marshal.ReadInt32(lParam);
 			var flags = Marshal.ReadInt32(lParam, 8);
 			var injected = (flags & 0x10) != 0;
+			if (!injected && key == Native.VK_ESCAPE && _enterRun) {
+				_sendAsIs.Set(); // Esc while formatting on Enter: send as typed
+				return (IntPtr)1;
+			}
+			if (!injected
+				&& key == Native.VK_RETURN
+				&& !Native.Down(Native.VK_SHIFT)
+				&& !Native.Down(Native.VK_CONTROL)
+				&& !Native.Down(Native.VK_MENU)
+				&& !Native.Down(Native.VK_LWIN)
+				&& !Native.Down(Native.VK_RWIN)) {
+				var window = Native.GetForegroundWindow();
+				var config = CurrentConfig();
+				if (config.Enabled && config.OnEnter && config.Apps.Contains(ProcessName(window))) {
+					if (_busy == 0) StartRun(window, Trigger.Enter);
+					return (IntPtr)1;
+				}
+			}
 			if (!injected
 				&& key == Native.VK_F
 				&& Native.Down(Native.VK_CONTROL)
@@ -1560,7 +1720,7 @@ public class TrayApp : ApplicationContext {
 				var name = ProcessName(window);
 				var config = Config.Load();
 				if (config.Enabled && config.Apps.Contains(name)) {
-					StartRun(window, true);
+					StartRun(window, Trigger.Hotkey);
 					return (IntPtr)1;
 				}
 			}
@@ -1576,12 +1736,19 @@ public class TrayApp : ApplicationContext {
 		return _config;
 	}
 
-	void StartRun(IntPtr window, bool fromHotkey) {
+	public enum Trigger { Hotkey, Button, Enter }
+	volatile bool _enterRun;
+	readonly ManualResetEvent _sendAsIs = new ManualResetEvent(false);
+
+	void StartRun(IntPtr window, Trigger trigger) {
 		if (window == IntPtr.Zero || Interlocked.CompareExchange(ref _busy, 1, 0) != 0) {
 			return;
 		}
 		SetBusy(true);
-		var thread = new Thread(() => Run(window, fromHotkey));
+		var thread = new Thread(() => {
+			if (trigger == Trigger.Enter) RunEnter(window);
+			else Run(window, trigger == Trigger.Hotkey);
+		});
 		thread.SetApartmentState(ApartmentState.STA);
 		thread.IsBackground = true;
 		thread.Start();
@@ -1630,6 +1797,22 @@ public class TrayApp : ApplicationContext {
 		_button.Client = client;
 		_button.Place(client, scale, config.ButtonRight, config.ButtonBottom);
 		if (!_button.Visible) _button.Show();
+	}
+
+	void SaveSetting(string name, object value) {
+		try {
+			var path = Path.Combine(Config.Folder(), "ayu_fancy.json");
+			var serializer = new JavaScriptSerializer();
+			var json = File.Exists(path)
+				? serializer.DeserializeObject(File.ReadAllText(path, Encoding.UTF8).TrimStart('\uFEFF')) as Dictionary<string, object>
+				: null;
+			if (json == null) json = new Dictionary<string, object>();
+			json[name] = value;
+			File.WriteAllText(path, serializer.Serialize(json), new UTF8Encoding(false));
+			_config = null;
+		} catch (Exception e) {
+			Log.Write("setting not saved: " + e.Message);
+		}
 	}
 
 	void SaveButtonPlace(int right, int bottom) {
@@ -1806,6 +1989,74 @@ public class TrayApp : ApplicationContext {
 		}
 	}
 
+	static bool HasWords(string text, int count) {
+		return Regex.Matches(text, "[\\p{L}\\p{N}]+").Count >= count;
+	}
+
+	// Enter in AyuGram: format the whole message, then send it. Esc sends it
+	// as typed; any failure or timeout sends it as typed too.
+	void RunEnter(IntPtr window) {
+		string saved = null;
+		_sendAsIs.Reset();
+		_enterRun = true;
+		try {
+			saved = Retry<string>(() => Clipboard.ContainsText() ? Clipboard.GetText() : null, null);
+			var source = CopyFromField(true);
+			// Search boxes, single words, stickers, empty field: Enter as usual.
+			if (source == null || !HasWords(source.Text, 2)) {
+				Native.Tap(Native.VK_RETURN);
+				return;
+			}
+			var config = CurrentConfig();
+			Show("\u2728 Оформляю и отправляю\u2026  Esc: отправить как есть", window, 0);
+			Engines.Result result = null;
+			var worker = new Thread(() => {
+				try { result = Engines.Format(config, source); } catch (Exception e) { result = new Engines.Result { Error = e.Message }; }
+			});
+			worker.IsBackground = true;
+			worker.Start();
+			var deadline = DateTime.Now.AddSeconds(config.EnterTimeout);
+			while (worker.IsAlive && DateTime.Now < deadline && !_sendAsIs.WaitOne(30)) {
+			}
+			var asIs = _sendAsIs.WaitOne(0);
+			if (Native.GetForegroundWindow() != window) {
+				Show("\u2728 Окно сменилось, не отправил", window, 4000);
+				return;
+			}
+			var now = CopyFromField(true);
+			if (!Same(now, source)) {
+				Show("\u2728 Текст поменялся, пока оформлял. Жми Enter ещё раз", window, 5000);
+				return;
+			}
+			if (asIs || worker.IsAlive || result == null || result.Error.Length > 0 || result.Text == null) {
+				var reason = asIs ? "Esc" : worker.IsAlive ? ("дольше " + config.EnterTimeout + " с") : (result == null ? "нет ответа" : result.Error);
+				Native.Tap(Native.VK_RETURN);
+				Show("\u2728 Отправил как есть: " + reason, window, 4000);
+				return;
+			}
+			WriteClipboard(result.Text);
+			Native.Press(Native.VK_CONTROL, 'A');
+			Thread.Sleep(40);
+			Native.Press(Native.VK_CONTROL, 'V');
+			Thread.Sleep(150);
+			Native.Tap(Native.VK_RETURN);
+			Show(string.Format("\u2728 Оформил и отправил ({0}, {1:0.0} с)", result.Engine, result.Milliseconds / 1000.0), window, 2500);
+			// The message is sent, the user's clipboard can come back now.
+			Thread.Sleep(1500);
+		} catch (Exception e) {
+			Log.Write("enter failed: " + e);
+			Show("\u2728 Ошибка, не отправил: " + e.Message, window, 5000);
+		} finally {
+			var text = saved;
+			RetryDo(() => {
+				if (text != null) Clipboard.SetText(text);
+			});
+			_enterRun = false;
+			Interlocked.Exchange(ref _busy, 0);
+			SetBusy(false);
+		}
+	}
+
 	static void keybd_up(int key) {
 		Native.keybd_event((byte)key, 0, 2, UIntPtr.Zero);
 	}
@@ -1826,7 +2077,7 @@ public static class Program {
 			report.AppendLine("tags: " + string.Join(" ", result.Text.Tags.Select(t => t.Offset + "+" + t.Length + ":" + t.Id.Replace('\\', '|'))));
 		}
 		File.WriteAllText(output, report.ToString(), new UTF8Encoding(false));
-		return result.Error.Length == 0 && result.Text != null && result.Text.Tags.Count > 0 ? 0 : 1;
+		return result.Error.Length == 0 && result.Text != null && result.Text.Text.Length > 0 ? 0 : 1;
 	}
 
 	[STAThread]
