@@ -1,39 +1,64 @@
 name: AyuGram AI build (Windows x64)
 
+# Builds AyuGram.exe (Release, x64, Qt 6) with AI dictation and publishes it
+# to the GitHub pre-release "ai-build", from where AYU_AI.cmd installs it.
+#
+# The first run builds all libraries (Qt, WebRTC, FFmpeg...) and may hit the
+# 6 hour job limit; built libraries are cached even on failure, so a re-run
+# continues from where it stopped.
+
 on:
   push:
     branches:
-      - 'claude/**'
+      - 'claude/busy-lamport-**'
+    paths-ignore:
+      - 'docs/**'
+      - 'tools/**'
+      - '**.md'
+      - 'changelog.txt'
+      - 'LEGAL'
+      - 'LICENSE'
+      - 'lib/xdg/**'
+      - 'snap/**'
+      - 'Telegram/build/docker/**'
+      - 'Telegram/SourceFiles/platform/linux/**'
+      - 'Telegram/SourceFiles/platform/mac/**'
   workflow_dispatch:
+
+concurrency:
+  group: ayu-win-ai-${{ github.ref }}
+  # A new push waits instead of killing hours of library builds.
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
-concurrency:
-  group: ayu-win-ai-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   windows:
-    name: Windows x64
+    name: Windows x64 Release
     runs-on: windows-latest
-    timeout-minutes: 355
+    timeout-minutes: 360
 
     env:
       PREPARE_PATH: "Telegram/build/prepare/prepare.py"
-      QT: qt6
+      BUILD_CONFIG: "Release"
+      RELEASE_TAG: "ai-build"
+      # Public Telegram Desktop credentials, the same AyuGram documents in
+      # docs/building-win.md.
+      API_ID: "2040"
+      API_HASH: "b18441a1ff607e10a989891a5462e627"
 
     defaults:
       run:
         shell: cmd
 
     steps:
+      # C: runs out of space while building Qt, D: is much larger.
       - name: Prepare directories.
         run: |
-          mkdir %userprofile%\TBuild\Libraries
-          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
-          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
-          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+          mkdir D:\TBuild\Libraries
+          echo TBUILD=D:\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=D:\TBuild\Libraries\win64>>%GITHUB_ENV%
 
       - name: Get repository name.
         shell: bash
@@ -43,7 +68,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+          path: src
+
+      - name: Move sources to the build folder.
+        run: |
+          move %GITHUB_WORKSPACE%\src %TBUILD%\%REPO_NAME%
 
       - name: First set up.
         shell: bash
@@ -52,12 +81,46 @@ jobs:
           SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
           echo "SDK=$SDK" >> $GITHUB_ENV
 
+          sed -i '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/${_Zi}//' "$PROGRAMFILES"/CMake/share/cmake*/Modules/Platform/Windows-MSVC.cmake
+
           echo "$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> CACHE_KEY.txt
           echo "$SDK" >> CACHE_KEY.txt
           echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
 
-          git config --global user.email "you@example.com"
-          git config --global user.name "Sample"
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+
+          df -h /c /d || true
+
+      # windows-latest moved to Visual Studio 18 without ATL for the 14.44
+      # toolset, breakpad's dump_syms then fails on atlbase.h.
+      - name: ATL for MSVC 14.44.
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          function Get-AtlToolsets {
+            Get-ChildItem "$vs\VC\Tools\MSVC" -Directory |
+              Where-Object { Test-Path "$($_.FullName)\atlmfc\include\atlbase.h" } |
+              ForEach-Object Name
+          }
+          $found = @(Get-AtlToolsets)
+          Write-Host "VS: $vs, ATL in: $($found -join ', ')"
+          if ($found -match '^14\.44\.') { exit 0 }
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          foreach ($component in @(
+              'Microsoft.VisualStudio.Component.VC.14.44.17.14.ATL',
+              'Microsoft.VisualStudio.Component.VC.ATL')) {
+            $p = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
+              'modify', '--installPath', "`"$vs`"", '--add', $component,
+              '--quiet', '--norestart', '--nocache')
+            Write-Host "$component -> $($p.ExitCode)"
+          }
+          $found = @(Get-AtlToolsets)
+          Write-Host "ATL now in: $($found -join ', ')"
+          if (-not ($found -match '^14\.44\.')) {
+            Write-Host "::warning::ATL for MSVC 14.44 is still missing"
+          }
 
       - uses: Eden-CI/msvc-dev-cmd@master
         name: Native Tools Command Prompt.
@@ -71,43 +134,93 @@ jobs:
           nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
           nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
 
-      # Caches are restored and saved explicitly, so that a first cold run
-      # that hits the time limit still keeps the prepared libraries.
-      - name: Restore ThirdParty cache.
+      - name: ThirdParty cache.
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.TBUILD }}\ThirdParty
-          key: ayu-win-x64-third-party-${{ env.CACHE_KEY }}
-          restore-keys: ayu-win-x64-third-party-
+          key: ai-third-party-${{ env.CACHE_KEY }}
+          restore-keys: ai-third-party-
 
-      - name: Restore Libraries cache.
+      - name: Libraries cache.
         uses: actions/cache/restore@v4
         with:
-          path: ${{ env.LibrariesPath }}
-          key: ayu-win-x64-libs-${{ env.QT }}-${{ env.CACHE_KEY }}
-          restore-keys: ayu-win-x64-libs-${{ env.QT }}-
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ai-libs-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ai-libs-${{ env.CACHE_KEY }}-
+            ai-libs-
+
+      - name: Qt cache.
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ai-qt6-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ai-qt6-${{ env.CACHE_KEY }}-
+            ai-qt6-
+
+      - name: Remember built libraries.
+        shell: bash
+        run: |
+          mkdir -p "$LibrariesPath/cache_keys"
+          echo "LIBS_BEFORE=$(ls -l "$LibrariesPath/cache_keys" | sha1sum | cut -c1-40)" >> $GITHUB_ENV
 
       - name: Libraries.
+        id: libs
+        timeout-minutes: 300
         run: |
-          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat skip-release silent %QT%
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat silent qt6
+
+      - name: Free up some disk space.
+        if: steps.libs.outcome == 'success'
+        shell: bash
+        run: |
+          find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' ')' -type f ')' -o -empty ')' -delete
+          df -h /c /d || true
+
+      - name: Check what changed in libraries.
+        if: always() && steps.libs.outcome != 'skipped'
+        shell: bash
+        run: |
+          AFTER=$(ls -l "$LibrariesPath/cache_keys" | sha1sum | cut -c1-40)
+          if [ "$AFTER" != "$LIBS_BEFORE" ]; then
+            echo "LIBS_CHANGED=true" >> $GITHUB_ENV
+          fi
 
       - name: Save ThirdParty cache.
-        if: always()
+        if: always() && env.LIBS_CHANGED == 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ env.TBUILD }}\ThirdParty
-          key: ayu-win-x64-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
-
-      - name: Free up some disk space.
-        shell: bash
-        run: find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' ')' -type f ')' -o -empty ')' -delete
+          key: ai-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
 
       - name: Save Libraries cache.
-        if: always()
+        if: always() && env.LIBS_CHANGED == 'true'
         uses: actions/cache/save@v4
         with:
-          path: ${{ env.LibrariesPath }}
-          key: ayu-win-x64-libs-${{ env.QT }}-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ai-libs-${{ env.CACHE_KEY }}-${{ github.run_id }}
+
+      - name: Save Qt cache.
+        if: always() && env.LIBS_CHANGED == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ai-qt6-${{ env.CACHE_KEY }}-${{ github.run_id }}
 
       - name: AyuGram build.
         run: |
@@ -115,23 +228,31 @@ jobs:
 
           call configure.bat ^
           x64 ^
-          %QT% ^
-          -D TDESKTOP_API_ID=2040 ^
-          -D TDESKTOP_API_HASH=b18441a1ff607e10a989891a5462e627 ^
-          -D CMAKE_CONFIGURATION_TYPES=Release ^
+          qt6 ^
+          -D TDESKTOP_API_ID=%API_ID% ^
+          -D TDESKTOP_API_HASH=%API_HASH% ^
+          -D CMAKE_CONFIGURATION_TYPES=%BUILD_CONFIG% ^
+          -D CMAKE_MSVC_DEBUG_INFORMATION_FORMAT= ^
           -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
           -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+          if errorlevel 1 exit /b 1
 
-          cmake --build ..\out --config Release --parallel
+          cmake --build ..\out --config %BUILD_CONFIG% --target Telegram --parallel
+          if errorlevel 1 exit /b 1
 
-      - name: Pack.
-        shell: pwsh
+      - name: Package.
+        shell: bash
         run: |
-          $out = "$env:TBUILD\$env:REPO_NAME\out\Release"
-          New-Item -ItemType Directory -Force artifact | Out-Null
-          Copy-Item "$out\AyuGram.exe" artifact\
-          if (Test-Path "$out\modules") { Copy-Item "$out\modules" artifact\ -Recurse }
-          Compress-Archive -Path artifact\* -DestinationPath AyuGram-AI-win64.zip -Force
+          OUT="$TBUILD/$REPO_NAME/out/$BUILD_CONFIG"
+          EXE="$(ls "$OUT"/AyuGram.exe "$OUT"/Telegram.exe 2>/dev/null | head -1)"
+          test -n "$EXE"
+          mkdir -p dist
+          cp "$EXE" dist/AyuGram.exe
+          echo "$GITHUB_SHA" > dist/version.txt
+          (cd dist && 7z a -tzip -mx=7 ../AyuGram-AI-win64.zip AyuGram.exe version.txt)
+          sha256sum AyuGram-AI-win64.zip | awk '{ print $1 }' > AyuGram-AI-win64.zip.sha256
+          cp dist/version.txt version.txt
+          ls -la AyuGram-AI-win64.zip dist
 
       - uses: actions/upload-artifact@v4
         name: Upload artifact.
@@ -141,11 +262,14 @@ jobs:
           retention-days: 7
 
       - name: Publish release.
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ai-build
-          name: AyuGram AI build
-          target_commitish: ${{ github.sha }}
-          prerelease: true
-          body: "Built from ${{ github.sha }} (${{ github.ref_name }})."
-          files: AyuGram-AI-win64.zip
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES="AyuGram: AI-диктовка (Ctrl+Shift+D, OpenAI) и улучшение текста на Enter, фикс Create with AI. Коммит ${GITHUB_SHA}, ветка ${GITHUB_REF_NAME}. Ставится через AYU_AI.cmd."
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --prerelease --title "AyuGram AI" --notes "$NOTES"
+          else
+            gh release edit "$RELEASE_TAG" --notes "$NOTES"
+          fi
+          gh release upload "$RELEASE_TAG" AyuGram-AI-win64.zip AyuGram-AI-win64.zip.sha256 version.txt --clobber
