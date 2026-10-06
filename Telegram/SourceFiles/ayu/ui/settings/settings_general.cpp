@@ -8,6 +8,8 @@
 
 #include "lang_auto.h"
 #include "ayu/ayu_settings.h"
+#include "ayu/features/dictation/ayu_dictation.h"
+#include "ayu/ui/boxes/edit_mark_box.h"
 #include "ayu/ui/settings/ayu_builder.h"
 #include "ayu/ui/settings/settings_ayu_utils.h"
 #include "ayu/ui/settings/settings_main.h"
@@ -115,6 +117,102 @@ void BuildTranslator(SectionBuilder &builder, AyuSectionBuilder &ayu) {
 	}
 }
 
+void BuildDictation(SectionBuilder &builder, AyuSectionBuilder &ayu) {
+	builder.addSubsectionTitle(tr::ayu_DictationSubtitle());
+
+	auto *settings = &AyuSettings::getInstance();
+
+	builder.addButton({
+		.id = u"ayu/aiDictationKey"_q,
+		.title = tr::ayu_DictationKey(),
+		.st = &st::settingsButtonNoIcon,
+		.label = settings->aiDictationKeyValue(
+		) | rpl::map([](const QString &key) {
+			return !key.trimmed().isEmpty()
+				? tr::ayu_DictationKeySet(tr::now)
+				: Ayu::Dictation::hasBuiltInKey()
+				? tr::ayu_DictationKeyBuiltIn(tr::now)
+				: tr::ayu_DictationKeyNotSet(tr::now);
+		}),
+		.onClick = [=] {
+			const auto window = Core::App().activeWindow();
+			const auto controller = window
+				? window->sessionController()
+				: nullptr;
+			if (!controller) {
+				return;
+			}
+			controller->show(Box<EditMarkBox>(
+				tr::ayu_DictationKey(),
+				settings->aiDictationKey(),
+				QString(),
+				[=](const QString &value) {
+					AyuSettings::getInstance().setAiDictationKey(
+						value.trimmed());
+				}));
+		},
+		.keywords = { u"openai"_q, u"voice"_q, u"speech"_q },
+	});
+
+	ayu.addSettingToggle({
+		.id = u"ayu/aiPolishOnEnter"_q,
+		.title = tr::ayu_DictationPolishOnEnter(),
+		.getter = &AyuSettings::aiPolishOnEnter,
+		.setter = &AyuSettings::setAiPolishOnEnter,
+	});
+
+	const auto options = std::vector{
+		std::pair(QString(), tr::ayu_DictationLanguageAuto(tr::now)),
+		std::pair(u"ru"_q, QString::fromUtf8("Русский")),
+		std::pair(u"en"_q, u"English"_q),
+	};
+	auto optionLabels = std::vector<QString>();
+	for (const auto &option : options) {
+		optionLabels.push_back(option.second);
+	}
+	const auto getIndex = [=](const QString &value) {
+		const auto i = ranges::find(
+			options,
+			value,
+			&std::pair<QString, QString>::first);
+		return (i != end(options)) ? int(i - begin(options)) : 0;
+	};
+	builder.addButton({
+		.id = u"ayu/aiPolishLanguage"_q,
+		.title = tr::ayu_DictationLanguage(),
+		.st = &st::settingsButtonNoIcon,
+		.label = settings->aiPolishLanguageValue(
+		) | rpl::map([=](const QString &value) {
+			return options[getIndex(value)].second;
+		}),
+		.onClick = [=] {
+			const auto window = Core::App().activeWindow();
+			const auto controller = window
+				? window->sessionController()
+				: nullptr;
+			if (!controller) {
+				return;
+			}
+			controller->show(Box([=](not_null<Ui::GenericBox*> box) {
+				SingleChoiceBox(box, {
+					.title = tr::ayu_DictationLanguage(),
+					.options = optionLabels,
+					.initialSelection = getIndex(
+						settings->aiPolishLanguage()),
+					.callback = [=](int index) {
+						AyuSettings::getInstance().setAiPolishLanguage(
+							options[index].first);
+					},
+				});
+			}));
+		},
+	});
+
+	builder.addSkip();
+	builder.addDividerText(tr::ayu_DictationAbout());
+	builder.addSkip();
+}
+
 void BuildShowPeerId(SectionBuilder &builder) {
 	auto *settings = &AyuSettings::getInstance();
 
@@ -159,6 +257,8 @@ void BuildQoLToggles(SectionBuilder &builder, AyuSectionBuilder &ayu) {
 
 	BuildTranslator(builder, ayu);
 	ayu.addSectionDivider();
+
+	BuildDictation(builder, ayu);
 
 	builder.addSubsectionTitle(tr::ayu_CategoryGeneral());
 

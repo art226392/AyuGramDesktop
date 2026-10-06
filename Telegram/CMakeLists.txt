@@ -223,6 +223,8 @@ set(ayugram_files
         ayu/features/forward/ayu_forward_rich.h
         ayu/features/forward/ayu_sync.cpp
         ayu/features/forward/ayu_sync.h
+        ayu/features/dictation/ayu_dictation.cpp
+        ayu/features/dictation/ayu_dictation.h
         ayu/features/translator/ayu_translator.cpp
         ayu/features/translator/ayu_translator.h
         ayu/features/translator/ayu_translate_provider.cpp
@@ -2318,6 +2320,9 @@ if (WIN32)
         target_link_libraries(Telegram PRIVATE desktop-app::win_directx_helper)
     endif()
 
+    # AyuGram: static Qt6Network (qdnslookup_win) needs DnsQueryEx and co.
+    target_link_libraries(Telegram PRIVATE dnsapi)
+
     target_link_options(Telegram PRIVATE /PDBPAGESIZE:8192)
 elseif (APPLE)
     if (NOT DESKTOP_APP_USE_PACKAGED)
@@ -2500,6 +2505,7 @@ PRIVATE
     TDESKTOP_API_ID=${TDESKTOP_API_ID}
     TDESKTOP_API_HASH=${TDESKTOP_API_HASH}
     G_LOG_DOMAIN="Telegram"
+    AYU_OPENAI_API_KEY="${AYU_OPENAI_API_KEY}"
     U_STATIC_IMPLEMENTATION=1 # AyuGram: do not use __declspec(dllimport) when including icu headers
 )
 
