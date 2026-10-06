@@ -1,0 +1,49 @@
+name: AyuGram AI publish
+
+# Publishes an already built AyuGram-AI-win64 artifact to the "ai-build"
+# pre-release without rebuilding (the build takes about two hours).
+
+on:
+  push:
+    branches:
+      - 'claude/busy-lamport-**'
+    paths:
+      - '.github/workflows/ayu-publish.yml'
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Build run id with the AyuGram-AI-win64 artifact'
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    name: Publish release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_ID: ${{ inputs.run_id || '37460477909' }}
+      RELEASE_TAG: ai-build
+    steps:
+      - name: Download artifact.
+        run: |
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" -n AyuGram-AI-win64 -D dl
+          ls -la dl
+
+      - name: Publish release.
+        working-directory: dl
+        run: |
+          unzip -p AyuGram-AI-win64.zip version.txt | tr -d '\r\n ' > version.txt
+          SHA="$(cat version.txt)"
+          test -n "$SHA"
+          sha256sum AyuGram-AI-win64.zip | awk '{ print $1 }' > AyuGram-AI-win64.zip.sha256
+          NOTES="AyuGram: AI-диктовка (Ctrl+Shift+D, OpenAI) и улучшение текста на Enter, фикс Create with AI. Коммит ${SHA}. Ставится через AYU_AI.cmd."
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" --prerelease --title "AyuGram AI" --notes "$NOTES"
+          else
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes "$NOTES"
+          fi
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" AyuGram-AI-win64.zip AyuGram-AI-win64.zip.sha256 version.txt --clobber

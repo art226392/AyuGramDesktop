@@ -12,6 +12,7 @@ on:
     branches:
       - 'claude/busy-lamport-**'
     paths-ignore:
+      - '.github/workflows/**'
       - 'docs/**'
       - 'tools/**'
       - '**.md'
@@ -275,9 +276,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           NOTES="AyuGram: AI-диктовка (Ctrl+Shift+D, OpenAI) и улучшение текста на Enter, фикс Create with AI. Коммит ${GITHUB_SHA}, ветка ${GITHUB_REF_NAME}. Ставится через AYU_AI.cmd."
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --prerelease --title "AyuGram AI" --notes "$NOTES"
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "AyuGram AI" --notes "$NOTES"
           else
-            gh release edit "$RELEASE_TAG" --notes "$NOTES"
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes "$NOTES"
           fi
-          gh release upload "$RELEASE_TAG" AyuGram-AI-win64.zip AyuGram-AI-win64.zip.sha256 version.txt --clobber
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" AyuGram-AI-win64.zip AyuGram-AI-win64.zip.sha256 version.txt --clobber
