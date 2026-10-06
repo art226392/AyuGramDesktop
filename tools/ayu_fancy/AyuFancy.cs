@@ -994,20 +994,52 @@ public static class Engines {
 		return answer;
 	}
 
+	// Codex and Groq race when both are there: the first good answer wins,
+	// Groq usually answers in about a second, Codex is the backup.
 	public static Answer Ask(Config config, string prompt) {
 		var codex = config.Engine != "groq" ? FindCodex(config) : null;
 		var chat = config.Engine != "codex" && !string.IsNullOrEmpty(config.Key);
 		if (codex == null && !chat) {
 			return new Answer { Error = config.Engine == "codex" ? "Codex не найден, запусти AYU_FANCY.cmd" : "Нет ни Codex, ни ключа Groq, запусти AYU_FANCY.cmd" };
 		}
-		if (codex != null) {
-			var answer = AskCodex(config, codex, prompt);
-			if (answer.Error.Length == 0 || !chat) return answer;
-			var spare = AskChat(config, config.Model, prompt);
-			if (spare.Error.Length > 0) spare.Error = answer.Error + "; " + spare.Error;
-			return spare;
+		if (codex == null) return AskChat(config, config.Model, prompt);
+		if (!chat) return AskCodex(config, codex, prompt);
+
+		var gate = new object();
+		Answer winner = null;
+		var errors = new List<string>();
+		var pending = 2;
+		var done = new ManualResetEvent(false);
+		Action<Func<Answer>> start = (ask) => {
+			var thread = new Thread(() => {
+				Answer answer;
+				try {
+					answer = ask();
+				} catch (Exception e) {
+					answer = new Answer { Error = e.Message };
+				}
+				lock (gate) {
+					--pending;
+					if (winner == null) {
+						if (answer.Error.Length == 0 && answer.Text.Length > 0) {
+							winner = answer;
+							done.Set();
+						} else {
+							errors.Add(answer.Error);
+						}
+					}
+					if (pending == 0) done.Set();
+				}
+			});
+			thread.IsBackground = true;
+			thread.Start();
+		};
+		start(() => AskChat(config, config.Model, prompt));
+		start(() => AskCodex(config, codex, prompt));
+		done.WaitOne();
+		lock (gate) {
+			return winner ?? new Answer { Error = string.Join("; ", errors.Where(e => e.Length > 0)) };
 		}
-		return AskChat(config, config.Model, prompt);
 	}
 
 	public class Result {
