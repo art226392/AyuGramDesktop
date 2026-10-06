@@ -636,6 +636,18 @@ public static class Core {
 		return BuildPrompt(html, extra, false);
 	}
 
+	// The same rules as system instructions for the warm Codex server: the
+	// message itself is then the whole user input, fewer tokens per turn.
+	public static string CleanInstructions(string extra) {
+		var prompt = BuildCleanPrompt("\u0000", extra);
+		var cut = prompt.IndexOf("Now the real message.", StringComparison.Ordinal);
+		return prompt.Substring(0, cut).TrimEnd() + "\nThe user message is the author's Telegram message between <<< and >>>. Answer with the edited message only.";
+	}
+
+	public static string CleanInput(string html) {
+		return "Message:\n<<<\n" + html + "\n>>>\nAnswer:";
+	}
+
 	// Clean mode: a careful copy editor, not a designer.
 	public static string BuildCleanPrompt(string html, string extra) {
 		var result = new StringBuilder();
@@ -860,6 +872,12 @@ public class Config {
 	public int CodexPreferMs = 3500;
 	// Formats in the background while the user pauses typing.
 	public bool Prefetch = true;
+	// Keep one warm `codex app-server` instead of `codex exec` per message.
+	public bool CodexServer = true;
+	// Dictation: Groq Whisper, the most accurate free one by default.
+	public string WhisperModel = "whisper-large-v3";
+	public string WhisperLanguage = "";
+	public bool Dictation = true;
 	public bool Button = true;
 	// Button position from the bottom right corner of the AyuGram window,
 	// in pixels at 100% scale: just above the send button by default.
@@ -910,6 +928,10 @@ public class Config {
 					result.Mode = Str(json, "mode", result.Mode).ToLowerInvariant();
 					result.OnEnter = Bool(json, "on_enter", true);
 					result.Prefetch = Bool(json, "prefetch", true);
+					result.CodexServer = Bool(json, "codex_server", true);
+					result.WhisperModel = Str(json, "whisper_model", result.WhisperModel);
+					result.WhisperLanguage = Str(json, "whisper_language", result.WhisperLanguage);
+					result.Dictation = Bool(json, "dictation", true);
 					object budget;
 					if (json.TryGetValue("enter_budget_ms", out budget) && budget is int) result.EnterBudgetMs = Math.Max(1000, (int)budget);
 					object timeout;
@@ -957,7 +979,457 @@ public class Answer {
 	public string Engine = "";
 }
 
+// Microphone through MCI, built into Windows: 16 kHz mono WAV, what
+// Whisper wants anyway, no drivers and nothing to install.
+public static class Recorder {
+	[DllImport("winmm.dll", CharSet = CharSet.Unicode)]
+	static extern int mciSendString(string command, StringBuilder answer, int answerLength, IntPtr callback);
+	[DllImport("winmm.dll", CharSet = CharSet.Unicode)]
+	static extern bool mciGetErrorString(int error, StringBuilder text, int length);
+
+	static void Command(string command) {
+		var error = mciSendString(command, null, 0, IntPtr.Zero);
+		if (error != 0) {
+			var text = new StringBuilder(256);
+			mciGetErrorString(error, text, 256);
+			throw new Exception(text.ToString());
+		}
+	}
+
+	public static void Start() {
+		try { Command("close ayurec"); } catch { }
+		Command("open new type waveaudio alias ayurec");
+		Command("set ayurec time format ms bitspersample 16 channels 1 samplespersec 16000 bytespersec 32000 alignment 2");
+		Command("record ayurec");
+	}
+
+	public static string Stop() {
+		var path = Path.Combine(Path.GetTempPath(), "ayufancy-" + Guid.NewGuid().ToString("N") + ".wav");
+		Command("stop ayurec");
+		Command("save ayurec \"" + path + "\"");
+		Command("close ayurec");
+		return path;
+	}
+
+	public static void Cancel() {
+		try { Command("stop ayurec"); } catch { }
+		try { Command("close ayurec"); } catch { }
+	}
+
+	// One second of silence, for the key check in AYU_FANCY.cmd.
+	public static byte[] SilenceWav() {
+		var stream = new MemoryStream();
+		var writer = new BinaryWriter(stream);
+		var data = 32000;
+		writer.Write(Encoding.ASCII.GetBytes("RIFF")); writer.Write(36 + data);
+		writer.Write(Encoding.ASCII.GetBytes("WAVEfmt ")); writer.Write(16);
+		writer.Write((short)1); writer.Write((short)1); writer.Write(16000); writer.Write(32000);
+		writer.Write((short)2); writer.Write((short)16);
+		writer.Write(Encoding.ASCII.GetBytes("data")); writer.Write(data);
+		writer.Write(new byte[data]);
+		writer.Flush();
+		return stream.ToArray();
+	}
+}
+
+public static class Whisper {
+	public static Answer Transcribe(Config config, byte[] wav) {
+		var answer = new Answer { Engine = "Whisper" };
+		if (string.IsNullOrEmpty(config.Key)) {
+			answer.Error = "для диктовки нужен бесплатный ключ Groq, запусти AYU_FANCY.cmd";
+			return answer;
+		}
+		var status = 0;
+		try {
+			ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+			var boundary = "----ayufancy" + Guid.NewGuid().ToString("N");
+			var request = (HttpWebRequest)WebRequest.Create(config.BaseUrl + "/audio/transcriptions");
+			request.Method = "POST";
+			request.ContentType = "multipart/form-data; boundary=" + boundary;
+			request.Headers["Authorization"] = "Bearer " + config.Key;
+			request.Timeout = 60000;
+			request.ReadWriteTimeout = 60000;
+			var body = new MemoryStream();
+			Action<string, string> field = (name, value) => {
+				var bytes = Encoding.UTF8.GetBytes("--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + name + "\"\r\n\r\n" + value + "\r\n");
+				body.Write(bytes, 0, bytes.Length);
+			};
+			field("model", config.WhisperModel);
+			field("response_format", "json");
+			field("temperature", "0");
+			if (!string.IsNullOrEmpty(config.WhisperLanguage)) field("language", config.WhisperLanguage);
+			field("prompt", "Привет! Это сообщение в Telegram, с заглавными буквами и пунктуацией. Hi, English words stay in English.");
+			var head = Encoding.UTF8.GetBytes("--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"speech.wav\"\r\nContent-Type: audio/wav\r\n\r\n");
+			body.Write(head, 0, head.Length);
+			body.Write(wav, 0, wav.Length);
+			var tail = Encoding.UTF8.GetBytes("\r\n--" + boundary + "--\r\n");
+			body.Write(tail, 0, tail.Length);
+			var payload = body.ToArray();
+			request.ContentLength = payload.Length;
+			using (var stream = request.GetRequestStream()) stream.Write(payload, 0, payload.Length);
+			string text;
+			try {
+				using (var response = (HttpWebResponse)request.GetResponse())
+				using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8)) {
+					status = (int)response.StatusCode;
+					text = reader.ReadToEnd();
+				}
+			} catch (WebException e) {
+				var response = e.Response as HttpWebResponse;
+				if (response == null) throw;
+				status = (int)response.StatusCode;
+				using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8)) text = reader.ReadToEnd();
+			}
+			var json = new JavaScriptSerializer().DeserializeObject(text) as Dictionary<string, object>;
+			if (status == 200 && json != null && json.ContainsKey("text")) {
+				answer.Text = ((json["text"] as string) ?? "").Trim();
+				return answer;
+			}
+			Log.Write("whisper " + status + ": " + (text.Length > 300 ? text.Substring(0, 300) : text));
+		} catch (Exception e) {
+			Log.Write("whisper failed: " + e.Message);
+		}
+		answer.Error = status == 401 ? "Groq: ключ не подходит" : status == 429 ? "Groq: лимит, подожди минуту" : status != 0 ? ("Whisper: ошибка " + status) : "Whisper: нет сети";
+		return answer;
+	}
+}
+
+// One warm `codex app-server` for all messages: no process start, no
+// login and connection setup per message, and our short editor rules as the
+// base instructions instead of the coding agent's long ones.
+public class CodexServer {
+	static readonly object Gate = new object();
+	static CodexServer _current;
+
+	readonly string _signature;
+	readonly Config _config;
+	readonly string _instructions;
+	readonly string _workDir;
+	Process _process;
+	readonly object _write = new object();
+	int _nextId = 100;
+	readonly Dictionary<int, Action<Dictionary<string, object>>> _pending = new Dictionary<int, Action<Dictionary<string, object>>>();
+	readonly Dictionary<string, Turn> _turns = new Dictionary<string, Turn>();
+	readonly Queue<string> _spare = new Queue<string>();
+	bool _spareStarting;
+	public bool Alive;
+
+	class Turn {
+		public readonly StringBuilder Delta = new StringBuilder();
+		public string Final;
+		public string Error;
+		public readonly ManualResetEvent Done = new ManualResetEvent(false);
+	}
+
+	CodexServer(Config config, string codex, string signature) {
+		_config = config;
+		_signature = signature;
+		_instructions = Core.CleanInstructions(config.Style);
+		_workDir = Path.Combine(Path.GetTempPath(), "ayufancy-server");
+		Directory.CreateDirectory(_workDir);
+		var args = new List<string> { "app-server" };
+		foreach (var feature in Engines.HeavyFeatures) {
+			args.Add("--disable");
+			args.Add(feature);
+		}
+		var info = new ProcessStartInfo {
+			FileName = codex,
+			Arguments = string.Join(" ", args.Select(a => Engines.Quote(a))),
+			UseShellExecute = false,
+			CreateNoWindow = true,
+			RedirectStandardInput = true,
+			RedirectStandardOutput = true,
+			RedirectStandardError = true,
+			StandardOutputEncoding = Encoding.UTF8,
+			StandardErrorEncoding = Encoding.UTF8,
+			WorkingDirectory = _workDir,
+		};
+		_process = new Process { StartInfo = info, EnableRaisingEvents = true };
+		_process.ErrorDataReceived += (s, e) => { };
+		_process.Exited += (s, e) => { Alive = false; FailAll("Codex-сервер закрылся"); };
+		_process.Start();
+		_process.BeginErrorReadLine();
+		var reader = new Thread(ReadLoop);
+		reader.IsBackground = true;
+		reader.Start();
+		Alive = true;
+		var init = Request("initialize", new Dictionary<string, object> {
+			{ "clientInfo", new Dictionary<string, object> { { "name", "ayufancy" }, { "title", "AyuFancy" }, { "version", "1.0" } } },
+		}, 30000);
+		if (init == null || init.ContainsKey("error")) {
+			Alive = false;
+			throw new Exception("Codex-сервер не ответил на initialize");
+		}
+		Notify("initialized", null);
+		Log.Write("codex server up");
+	}
+
+	public static string SignatureOf(Config config, string codex) {
+		return codex + "|" + config.CodexModel + "|" + config.CodexEffort + "|" + config.Style;
+	}
+
+	// Starts (or reuses) the server and keeps a spare thread ready.
+	public static CodexServer Get(Config config, string codex) {
+		var signature = SignatureOf(config, codex);
+		lock (Gate) {
+			if (_current != null && _current.Alive && _current._signature == signature) {
+				return _current;
+			}
+			if (_current != null) _current.Stop();
+			_current = null;
+			var server = new CodexServer(config, codex, signature);
+			_current = server;
+			server.PrepareSpare();
+			return server;
+		}
+	}
+
+	public static void Warm(Config config, string codex) {
+		try {
+			Get(config, codex);
+		} catch (Exception e) {
+			Log.Write("codex server warm: " + e.Message);
+		}
+	}
+
+	void Stop() {
+		Alive = false;
+		try { _process.Kill(); } catch { }
+	}
+
+	void Send(Dictionary<string, object> message) {
+		var line = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Serialize(message);
+		lock (_write) {
+			_process.StandardInput.WriteLine(line);
+			_process.StandardInput.Flush();
+		}
+	}
+
+	void Notify(string method, Dictionary<string, object> parameters) {
+		var message = new Dictionary<string, object> { { "method", method } };
+		if (parameters != null) message["params"] = parameters;
+		Send(message);
+	}
+
+	Dictionary<string, object> Request(string method, Dictionary<string, object> parameters, int timeoutMs) {
+		var done = new ManualResetEvent(false);
+		Dictionary<string, object> answer = null;
+		int id;
+		lock (_pending) {
+			id = _nextId++;
+			_pending[id] = (message) => { answer = message; done.Set(); };
+		}
+		Send(new Dictionary<string, object> { { "id", id }, { "method", method }, { "params", parameters } });
+		if (!done.WaitOne(timeoutMs)) {
+			lock (_pending) _pending.Remove(id);
+			return null;
+		}
+		return answer;
+	}
+
+	static Dictionary<string, object> Dict(object value) {
+		return value as Dictionary<string, object>;
+	}
+
+	static string Str(Dictionary<string, object> json, string name) {
+		object value;
+		return json != null && json.TryGetValue(name, out value) ? value as string : null;
+	}
+
+	void ReadLoop() {
+		var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+		try {
+			string line;
+			while ((line = _process.StandardOutput.ReadLine()) != null) {
+				Dictionary<string, object> message;
+				try {
+					message = Dict(serializer.DeserializeObject(line));
+				} catch {
+					continue;
+				}
+				if (message == null) continue;
+				object idValue;
+				var hasId = message.TryGetValue("id", out idValue) && idValue is int;
+				var method = Str(message, "method");
+				if (hasId && method == null) {
+					Action<Dictionary<string, object>> callback = null;
+					lock (_pending) {
+						if (_pending.TryGetValue((int)idValue, out callback)) _pending.Remove((int)idValue);
+					}
+					if (callback != null) callback(message);
+					continue;
+				}
+				if (hasId && method != null) {
+					// A server request (approval and the like): never wanted here.
+					Send(new Dictionary<string, object> { { "id", idValue }, { "error", new Dictionary<string, object> { { "code", -32601 }, { "message", "not supported" } } } });
+					continue;
+				}
+				OnNotification(method, Dict(message.ContainsKey("params") ? message["params"] : null));
+			}
+		} catch {
+		}
+		Alive = false;
+		FailAll("Codex-сервер закрылся");
+	}
+
+	Turn TurnOf(Dictionary<string, object> parameters) {
+		var thread = Str(parameters, "threadId");
+		if (thread == null) return null;
+		lock (_turns) {
+			Turn turn;
+			return _turns.TryGetValue(thread, out turn) ? turn : null;
+		}
+	}
+
+	void OnNotification(string method, Dictionary<string, object> parameters) {
+		if (method == null || parameters == null) return;
+		var turn = TurnOf(parameters);
+		if (turn == null) return;
+		if (method == "item/agentMessage/delta") {
+			lock (turn) turn.Delta.Append(Str(parameters, "delta") ?? "");
+		} else if (method == "item/completed") {
+			var item = Dict(parameters.ContainsKey("item") ? parameters["item"] : null);
+			if (Str(item, "type") == "agentMessage") turn.Final = Str(item, "text");
+		} else if (method == "error") {
+			object retry;
+			var willRetry = parameters.TryGetValue("willRetry", out retry) && retry is bool && (bool)retry;
+			var message = Str(Dict(parameters.ContainsKey("error") ? parameters["error"] : null), "message") ?? "ошибка";
+			if (!willRetry || message.IndexOf("401", StringComparison.Ordinal) >= 0 || message.IndexOf("nauthorized", StringComparison.Ordinal) >= 0) {
+				turn.Error = message;
+				turn.Done.Set();
+			}
+		} else if (method == "turn/completed") {
+			var data = Dict(parameters.ContainsKey("turn") ? parameters["turn"] : null);
+			if (Str(data, "status") == "failed") {
+				turn.Error = Str(Dict(data != null && data.ContainsKey("error") ? data["error"] : null), "message") ?? "turn failed";
+			}
+			turn.Done.Set();
+		}
+	}
+
+	void FailAll(string error) {
+		lock (_turns) {
+			foreach (var turn in _turns.Values) {
+				if (turn.Error == null) turn.Error = error;
+				turn.Done.Set();
+			}
+		}
+		lock (_pending) {
+			foreach (var callback in _pending.Values.ToList()) {
+				try { callback(new Dictionary<string, object> { { "error", error } }); } catch { }
+			}
+			_pending.Clear();
+		}
+	}
+
+	string StartThread() {
+		var parameters = new Dictionary<string, object> {
+			{ "ephemeral", true },
+			{ "sandbox", "read-only" },
+			{ "approvalPolicy", "never" },
+			{ "cwd", _workDir },
+			{ "baseInstructions", _instructions },
+		};
+		if (!string.IsNullOrEmpty(_config.CodexModel)) parameters["model"] = _config.CodexModel;
+		var answer = Request("thread/start", parameters, 20000);
+		var result = Dict(answer != null && answer.ContainsKey("result") ? answer["result"] : null);
+		var thread = Dict(result != null && result.ContainsKey("thread") ? result["thread"] : null);
+		var id = Str(thread, "id");
+		if (id == null) {
+			var error = Dict(answer != null && answer.ContainsKey("error") ? answer["error"] : null);
+			throw new Exception("thread/start: " + (Str(error, "message") ?? "нет ответа"));
+		}
+		return id;
+	}
+
+	void PrepareSpare() {
+		lock (_spare) {
+			if (_spareStarting || _spare.Count > 0) return;
+			_spareStarting = true;
+		}
+		var worker = new Thread(() => {
+			try {
+				var id = StartThread();
+				lock (_spare) _spare.Enqueue(id);
+			} catch (Exception e) {
+				Log.Write("spare thread: " + e.Message);
+			} finally {
+				lock (_spare) _spareStarting = false;
+			}
+		});
+		worker.IsBackground = true;
+		worker.Start();
+	}
+
+	public Answer Ask(string input, int timeoutMs) {
+		var answer = new Answer { Engine = "Codex" };
+		string thread = null;
+		lock (_spare) {
+			if (_spare.Count > 0) thread = _spare.Dequeue();
+		}
+		if (thread == null) thread = StartThread();
+		PrepareSpare();
+		var turn = new Turn();
+		lock (_turns) _turns[thread] = turn;
+		try {
+			var parameters = new Dictionary<string, object> {
+				{ "threadId", thread },
+				{ "input", new object[] { new Dictionary<string, object> { { "type", "text" }, { "text", input } } } },
+			};
+			if (!string.IsNullOrEmpty(_config.CodexEffort)) parameters["effort"] = _config.CodexEffort;
+			var started = Request("turn/start", parameters, 15000);
+			if (started == null || started.ContainsKey("error")) {
+				var error = Dict(started != null && started.ContainsKey("error") ? started["error"] : null);
+				answer.Error = "Codex: " + (Str(error, "message") ?? "turn/start без ответа");
+				return answer;
+			}
+			if (!turn.Done.WaitOne(timeoutMs)) {
+				answer.Error = "Codex не ответил за " + (timeoutMs / 1000) + " с";
+				return answer;
+			}
+			if (turn.Error != null) {
+				answer.Error = (turn.Error.IndexOf("401", StringComparison.Ordinal) >= 0 || turn.Error.IndexOf("nauthorized", StringComparison.Ordinal) >= 0)
+					? "Codex не вошёл в аккаунт, запусти AYU_FANCY.cmd"
+					: "Codex: " + turn.Error;
+				return answer;
+			}
+			string text;
+			lock (turn) text = turn.Final ?? turn.Delta.ToString();
+			answer.Text = (text ?? "").Trim();
+			if (answer.Text.Length == 0) answer.Error = "Codex вернул пустой ответ";
+			return answer;
+		} finally {
+			lock (_turns) _turns.Remove(thread);
+			try { Notify("thread/unsubscribe", new Dictionary<string, object> { { "threadId", thread } }); } catch { }
+		}
+	}
+}
+
 public static class Engines {
+	public static readonly string[] HeavyFeatures = {
+		"apps", "browser_use", "browser_use_external", "computer_use",
+		"image_generation", "multi_agent", "plugins", "remote_plugin",
+		"shell_tool", "unified_exec", "view_image", "skill_search",
+		"tool_suggest", "sleep_tool", "goals", "hooks", "in_app_browser",
+		"realtime_conversation", "worktrees", "workspace_dependencies",
+		"unbounded_connection_retries" };
+
+	// Warm server first, the one-shot `codex exec` when the server can't run.
+	public static Answer AskCodexFast(Config config, string codex, string html) {
+		if (config.CodexServer) {
+			try {
+				var server = CodexServer.Get(config, codex);
+				var answer = server.Ask(Core.CleanInput(html), 45000);
+				Log.Write("codex server: " + (answer.Error.Length > 0 ? answer.Error : "ok"));
+				// A model or network error would be the same through `codex exec`.
+				return answer;
+			} catch (Exception e) {
+				Log.Write("codex server failed: " + e.Message);
+			}
+		}
+		return AskCodex(config, codex, Core.BuildCleanPrompt(html, config.Style));
+	}
+
 	public static string Quote(string arg) {
 		if (arg.Length > 0 && arg.IndexOfAny(new[] { ' ', '\t', '"' }) < 0) {
 			return arg;
@@ -1017,13 +1489,7 @@ public static class Engines {
 		if (!config.CodexUserConfig) args.Add("--ignore-user-config");
 		// Every tool description goes to the model with each request:
 		// formatting text needs none of them, without them it answers faster.
-		foreach (var feature in new[] {
-				"apps", "browser_use", "browser_use_external", "computer_use",
-				"image_generation", "multi_agent", "plugins", "remote_plugin",
-				"shell_tool", "unified_exec", "view_image", "skill_search",
-				"tool_suggest", "sleep_tool", "goals", "hooks", "in_app_browser",
-				"realtime_conversation", "worktrees", "workspace_dependencies",
-				"unbounded_connection_retries" }) {
+		foreach (var feature in HeavyFeatures) {
 			args.Add("--disable");
 			args.Add(feature);
 		}
@@ -1228,7 +1694,8 @@ public static class Engines {
 		var watch = Stopwatch.StartNew();
 		var items = new List<Protected>();
 		var prepared = Core.Protect(source, items);
-		var prompt = Core.BuildCleanPrompt(Core.ToHtml(prepared), config.Style);
+		var html = Core.ToHtml(prepared);
+		var prompt = Core.BuildCleanPrompt(html, config.Style);
 		Tagged best = null;
 		var errors = new List<string>();
 		// The chosen Codex model is preferred; Groq, when there is a key, runs
@@ -1240,7 +1707,7 @@ public static class Engines {
 		var codexDone = new ManualResetEvent(codex == null);
 		var chatDone = new ManualResetEvent(!chat);
 		if (codex != null) {
-			var thread = new Thread(() => { codexAnswer = AskCodex(config, codex, prompt); codexDone.Set(); });
+			var thread = new Thread(() => { codexAnswer = AskCodexFast(config, codex, html); codexDone.Set(); });
 			thread.IsBackground = true;
 			thread.Start();
 		}
@@ -1274,8 +1741,8 @@ public static class Engines {
 			if (answer.Error.Length > 0) { errors.Add(answer.Error); continue; }
 			int lost;
 			// A heading gets an empty line under it, it can't be bold here.
-			var html = Regex.Replace(Core.CleanAnswer(answer.Text), "(</h[1-6]>)(?!\\s*<br)", "$1<br>", RegexOptions.IgnoreCase);
-			var restored = Core.Restore(Core.FromHtml(html, false), items, out lost);
+			var answerHtml = Regex.Replace(Core.CleanAnswer(answer.Text), "(</h[1-6]>)(?!\\s*<br)", "$1<br>", RegexOptions.IgnoreCase);
+			var restored = Core.Restore(Core.FromHtml(answerHtml, false), items, out lost);
 			restored = Core.Enforce(source, restored);
 			if (!Core.LooksSane(source, restored)) { errors.Add(answer.Engine + " вернул что-то не то"); continue; }
 			best = restored;
@@ -1569,6 +2036,14 @@ public class SparkButton : Form {
 		base.WndProc(ref m);
 	}
 
+	public string Glyph = "\u2728";
+	bool _recording;
+
+	public bool Recording {
+		get { return _recording; }
+		set { _recording = value; Invalidate(); }
+	}
+
 	public bool Busy {
 		get { return _busy; }
 		set { _busy = value; Invalidate(); }
@@ -1593,13 +2068,13 @@ public class SparkButton : Form {
 		var g = e.Graphics;
 		g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
 		g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-		var color = _busy ? Color.FromArgb(110, 110, 130) : _hover ? Color.FromArgb(160, 105, 255) : Color.FromArgb(132, 82, 240);
+		var color = _recording ? Color.FromArgb(230, 60, 70) : _busy ? Color.FromArgb(110, 110, 130) : _hover ? Color.FromArgb(160, 105, 255) : Color.FromArgb(132, 82, 240);
 		using (var brush = new SolidBrush(color)) {
 			g.FillEllipse(brush, 1, 1, Width - 3, Height - 3);
 		}
 		using (var font = new Font("Segoe UI Emoji", Height * 0.42f, GraphicsUnit.Pixel)) {
 			var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-			g.DrawString(_busy ? "\u2026" : "\u2728", font, Brushes.White, new RectangleF(0, 1, Width - 1, Height - 1), format);
+			g.DrawString(_busy && !_recording ? "\u2026" : _recording ? "\u25A0" : Glyph, font, Brushes.White, new RectangleF(0, 1, Width - 1, Height - 1), format);
 		}
 	}
 
@@ -1716,6 +2191,10 @@ public class TrayApp : ApplicationContext {
 	readonly IntPtr _hook;
 	readonly Dictionary<uint, string> _names = new Dictionary<uint, string>();
 	readonly SparkButton _button;
+	readonly SparkButton _mic;
+	volatile bool _recording;
+	int _transcribing;
+	IntPtr _micWindow;
 	readonly System.Windows.Forms.Timer _follow;
 	IntPtr _target;
 	int _busy;
@@ -1738,6 +2217,9 @@ public class TrayApp : ApplicationContext {
 		_tray.ContextMenuStrip.Items.Add("Лог", null, (s, e) => OpenFile("ayu_fancy.log"));
 		_tray.ContextMenuStrip.Items.Add("Выход", null, (s, e) => ExitThread());
 		_button = new SparkButton();
+		_mic = new SparkButton { Glyph = "\U0001F399" };
+		_mic.Clicked = () => ToggleDictation(_target);
+		_mic.Moved = (right, bottom) => SaveButtonPlace(right - 40, bottom);
 		_button.Clicked = () => StartRun(_target, Trigger.Button);
 		_button.Moved = SaveButtonPlace;
 		_follow = new System.Windows.Forms.Timer { Interval = 150 };
@@ -1811,6 +2293,22 @@ public class TrayApp : ApplicationContext {
 			if (injected || config == null || !config.Enabled) {
 				return Native.CallNextHookEx(_hook, code, wParam, lParam);
 			}
+			if (_recording && key == Native.VK_ESCAPE) {
+				CancelDictation();
+				return (IntPtr)1;
+			}
+			if (key == 0x20 && config.Dictation
+				&& Native.Down(Native.VK_CONTROL)
+				&& Native.Down(Native.VK_SHIFT)
+				&& !Native.Down(Native.VK_MENU)) {
+				var window = Native.GetForegroundWindow();
+				int pid;
+				if (_recording || IsAppWindow(window, out pid)) {
+					var target = _recording ? _micWindow : window;
+					try { _mic.BeginInvoke(new Action(() => ToggleDictation(target))); } catch { }
+					return (IntPtr)1;
+				}
+			}
 			if (_enterRun && (key == Native.VK_ESCAPE || key == Native.VK_RETURN)) {
 				_sendAsIs.Set(); // Esc or a second Enter: send as typed now
 				return (IntPtr)1;
@@ -1864,17 +2362,23 @@ public class TrayApp : ApplicationContext {
 	void Background() {
 		var lastConfig = DateTime.MinValue;
 		var lastApps = DateTime.MinValue;
+		var lastWarm = DateTime.MinValue;
 		string lastText = null;
 		var changedAt = DateTime.Now;
 		while (true) {
 			try {
-				Thread.Sleep(250);
+				Thread.Sleep(150);
 				var now = DateTime.Now;
 				if ((now - lastConfig).TotalSeconds >= 2 || _cfg == null) {
 					_cfg = Config.Load();
 					lastConfig = now;
 				}
 				var config = _cfg;
+				if (config.Enabled && config.CodexServer && config.Engine != "groq" && (now - lastWarm).TotalSeconds >= 10) {
+					lastWarm = now;
+					var codex = Engines.FindCodex(config);
+					if (codex != null) CodexServer.Warm(config, codex);
+				}
 				if ((now - lastApps).TotalSeconds >= 3) {
 					var pids = new HashSet<int>();
 					foreach (var process in Process.GetProcesses()) {
@@ -1898,7 +2402,7 @@ public class TrayApp : ApplicationContext {
 					changedAt = now;
 					continue;
 				}
-				if ((now - changedAt).TotalMilliseconds >= 900 && Worth(text)) {
+				if ((now - changedAt).TotalMilliseconds >= 450 && Worth(text)) {
 					_pre.Prefetch(text, config);
 				}
 			} catch (Exception e) {
@@ -1951,7 +2455,7 @@ public class TrayApp : ApplicationContext {
 		var config = _cfg;
 		if (config == null) return;
 		var foreground = Native.GetForegroundWindow();
-		if (foreground == _button.Handle || _button.Dragging) {
+		if (foreground == _button.Handle || foreground == _mic.Handle || _button.Dragging || _mic.Dragging) {
 			return;
 		}
 		var window = foreground != IntPtr.Zero ? Native.GetAncestor(foreground, 2) : IntPtr.Zero; // GA_ROOT
@@ -1964,11 +2468,13 @@ public class TrayApp : ApplicationContext {
 			&& !Native.IsIconic(window);
 		if (!show) {
 			if (_button.Visible && _busy == 0) _button.Hide();
+			if (_mic.Visible && !_recording) _mic.Hide();
 			return;
 		}
 		Native.RECT rect;
 		if (!Native.GetClientRect(window, out rect) || rect.Right < 300 || rect.Bottom < 200) {
 			if (_button.Visible) _button.Hide();
+			if (_mic.Visible && !_recording) _mic.Hide();
 			return;
 		}
 		var origin = new Point(0, 0);
@@ -1984,6 +2490,13 @@ public class TrayApp : ApplicationContext {
 		_button.Client = client;
 		_button.Place(client, scale, config.ButtonRight, config.ButtonBottom);
 		if (!_button.Visible) _button.Show();
+		if (config.Dictation) {
+			_mic.Client = client;
+			_mic.Place(client, scale, config.ButtonRight + 40, config.ButtonBottom);
+			if (!_mic.Visible) _mic.Show();
+		} else if (_mic.Visible && !_recording) {
+			_mic.Hide();
+		}
 	}
 
 	void SaveSetting(string name, object value) {
@@ -2180,6 +2693,82 @@ public class TrayApp : ApplicationContext {
 		return Regex.Matches(text, "[\\p{L}\\p{N}]+").Count >= count;
 	}
 
+	// Click on the mic (or Ctrl+Shift+Space): start; again: stop, Whisper,
+	// the text goes into the field at the caret. Esc while recording: cancel.
+	void ToggleDictation(IntPtr window) {
+		if (_recording) {
+			_recording = false;
+			_mic.Recording = false;
+			if (Interlocked.CompareExchange(ref _transcribing, 1, 0) != 0) return;
+			var target = _micWindow;
+			var worker = new Thread(() => FinishDictation(target));
+			worker.SetApartmentState(ApartmentState.STA);
+			worker.IsBackground = true;
+			worker.Start();
+			return;
+		}
+		if (_transcribing != 0 || window == IntPtr.Zero) return;
+		try {
+			Recorder.Start();
+		} catch (Exception e) {
+			Log.Write("mic: " + e.Message);
+			Show("\U0001F399 Микрофон не открылся: " + e.Message, window, 5000);
+			return;
+		}
+		_micWindow = window;
+		_recording = true;
+		_mic.Recording = true;
+		Show("\U0001F399 Говори\u2026  Клик по \U0001F399 или Ctrl+Shift+Пробел: готово, Esc: отмена", window, 0);
+	}
+
+	void CancelDictation() {
+		_recording = false;
+		try { _mic.BeginInvoke(new Action(() => _mic.Recording = false)); } catch { }
+		var worker = new Thread(() => Recorder.Cancel());
+		worker.IsBackground = true;
+		worker.Start();
+		Show("\U0001F399 Отменено", _micWindow, 1500);
+	}
+
+	void FinishDictation(IntPtr window) {
+		string path = null;
+		try {
+			path = Recorder.Stop();
+			Show("\U0001F399 Распознаю\u2026", window, 0);
+			var watch = Stopwatch.StartNew();
+			var answer = Whisper.Transcribe(CurrentConfig(), File.ReadAllBytes(path));
+			if (answer.Error.Length > 0) {
+				Show("\U0001F399 " + answer.Error, window, 5000);
+				return;
+			}
+			if (answer.Text.Length == 0) {
+				Show("\U0001F399 Ничего не расслышал", window, 2500);
+				return;
+			}
+			if (Native.GetForegroundWindow() != window) {
+				Native.SetForegroundWindow(window);
+				Thread.Sleep(120);
+			}
+			uint id;
+			Native.GetWindowThreadProcessId(window, out id);
+			var before = FieldReader.Read((int)id);
+			var text = answer.Text;
+			if (!string.IsNullOrEmpty(before) && !char.IsWhiteSpace(before[before.Length - 1])) text = " " + text;
+			var saved = Retry<string>(() => Clipboard.ContainsText() ? Clipboard.GetText() : null, null);
+			RetryDo(() => Clipboard.SetText(text));
+			Native.Press(Native.VK_CONTROL, 'V');
+			Thread.Sleep(400);
+			RetryDo(() => { if (saved != null) Clipboard.SetText(saved); });
+			Show(string.Format("\U0001F399 Готово, {0:0.0} с. Enter оформит и отправит", watch.ElapsedMilliseconds / 1000.0), window, 2500);
+		} catch (Exception e) {
+			Log.Write("dictation: " + e);
+			Show("\U0001F399 Ошибка: " + e.Message, window, 5000);
+		} finally {
+			if (path != null) { try { File.Delete(path); } catch { } }
+			Interlocked.Exchange(ref _transcribing, 0);
+		}
+	}
+
 	// Enter in AyuGram: the message goes out within EnterBudgetMs, formatted
 	// if the formatting is ready by then (usually prefetched while typing),
 	// as typed otherwise. The field is not touched while waiting.
@@ -2221,9 +2810,11 @@ public class TrayApp : ApplicationContext {
 				return;
 			}
 			var ok = result != null && result.Error.Length == 0 && result.Text != null;
+			Log.Write(string.Format("enter: uia {0}, waited {1} ms, job {2}, {3}", viaUia ? "ok" : "no", watch.ElapsedMilliseconds,
+				job.Done.WaitOne(0) ? "done" : "running", result == null ? "not ready" : (result.Error.Length > 0 ? result.Error : (result.Engine + " " + result.Milliseconds + " ms"))));
 			if (!ok) {
 				Native.Tap(Native.VK_RETURN);
-				if (shown) {
+				if (true) {
 					var reason = _sendAsIs.WaitOne(0) ? "по твоей команде" : result == null ? ("не успел за " + (config.EnterBudgetMs / 1000.0).ToString("0.#") + " с") : result.Error;
 					Show("\u2728 Отправил как есть: " + reason, window, 2500);
 				}
@@ -2231,6 +2822,7 @@ public class TrayApp : ApplicationContext {
 			}
 			if (result.Text.Text == text && result.Text.Tags.Count == 0) {
 				Native.Tap(Native.VK_RETURN); // nothing to change
+				Show("\u2728 Тут нечего править", window, 1200);
 				return;
 			}
 			if (!savedTaken) {
@@ -2269,7 +2861,11 @@ public static class Program {
 	// does and writes a report, for AYU_FANCY.cmd.
 	static int SelfTest(string input, string output) {
 		var text = File.ReadAllText(input, Encoding.UTF8).TrimStart('\uFEFF').Replace("\r\n", "\n").Trim();
-		var result = Engines.Format(Config.Load(), new Tagged(text, null));
+		var config = Config.Load();
+		// The warm server starts once per app run: keep that out of the timing.
+		var codex = config.Engine != "groq" && config.CodexServer ? Engines.FindCodex(config) : null;
+		if (codex != null) CodexServer.Warm(config, codex);
+		var result = Engines.Format(config, new Tagged(text, null));
 		var report = new StringBuilder();
 		report.AppendLine("engine: " + result.Engine);
 		report.AppendLine("seconds: " + (result.Milliseconds / 1000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
@@ -2286,6 +2882,11 @@ public static class Program {
 	public static int Main(string[] args) {
 		if (args.Length == 3 && args[0] == "--selftest") {
 			return SelfTest(args[1], args[2]);
+		}
+		if (args.Length == 2 && args[0] == "--whisper-test") {
+			var answer = Whisper.Transcribe(Config.Load(), Recorder.SilenceWav());
+			File.WriteAllText(args[1], "error: " + answer.Error + "\ntext: " + answer.Text + "\n", new UTF8Encoding(false));
+			return answer.Error.Length == 0 ? 0 : 1;
 		}
 		if (args.Length == 1 && args[0] == "--version") {
 			return 0;
