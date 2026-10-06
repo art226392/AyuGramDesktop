@@ -73,6 +73,7 @@ enum class Command {
 
 	RecordVoice,
 	RecordRound,
+	AyuDictate,
 
 	ReadChat,
 	ArchiveChat,

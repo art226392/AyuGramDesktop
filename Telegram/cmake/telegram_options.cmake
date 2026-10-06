@@ -8,6 +8,12 @@ option(TDESKTOP_API_TEST "Use test API credentials." OFF)
 set(TDESKTOP_API_ID "0" CACHE STRING "Provide 'api_id' for the Telegram API access.")
 set(TDESKTOP_API_HASH "" CACHE STRING "Provide 'api_hash' for the Telegram API access.")
 
+# AyuGram: optional OpenAI key baked into the build for AI dictation.
+set(AYU_OPENAI_API_KEY "" CACHE STRING "OpenAI API key used by AI dictation by default.")
+if (AYU_OPENAI_API_KEY STREQUAL "" AND DEFINED ENV{AYU_OPENAI_API_KEY})
+    set(AYU_OPENAI_API_KEY "$ENV{AYU_OPENAI_API_KEY}")
+endif()
+
 if (TDESKTOP_API_TEST)
     set(TDESKTOP_API_ID 17349)
     set(TDESKTOP_API_HASH 344583e45741c457fe1862106095a5eb)
