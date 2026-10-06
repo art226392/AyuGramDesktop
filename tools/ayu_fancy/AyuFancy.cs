@@ -879,6 +879,8 @@ public class Config {
 	public string WhisperLanguage = "";
 	public bool Dictation = true;
 	public bool Button = true;
+	// The "Оформление ВКЛ/ВЫКЛ" pill next to the ✨ button.
+	public bool Toggle = true;
 	// Button position from the bottom right corner of the AyuGram window,
 	// in pixels at 100% scale: just above the send button by default.
 	public int ButtonRight = 14;
@@ -925,6 +927,7 @@ public class Config {
 					result.Model = Str(json, "model", result.Model);
 					result.Style = Str(json, "style", result.Style);
 					result.Button = Bool(json, "button", true);
+					result.Toggle = Bool(json, "toggle", true);
 					result.Mode = Str(json, "mode", result.Mode).ToLowerInvariant();
 					result.OnEnter = Bool(json, "on_enter", true);
 					result.Prefetch = Bool(json, "prefetch", true);
@@ -2115,6 +2118,114 @@ public class SparkButton : Form {
 	}
 }
 
+// "Оформление ВКЛ/ВЫКЛ" pill left of the ✨ button: formatting on Enter
+// on or off in one click, always in sight while typing in AyuGram.
+// Never takes the focus, so the message field stays active.
+public class EnterToggle : Form {
+	public Action Clicked;
+	public const int BaseWidth = 152;
+	public const int BaseHeight = 26;
+	bool _on = true;
+	bool _hover;
+
+	public EnterToggle() {
+		FormBorderStyle = FormBorderStyle.None;
+		ShowInTaskbar = false;
+		TopMost = true;
+		StartPosition = FormStartPosition.Manual;
+		BackColor = Color.FromArgb(36, 32, 48);
+		DoubleBuffered = true;
+		Cursor = Cursors.Hand;
+		Size = new Size(BaseWidth, BaseHeight);
+		var tip = new ToolTip();
+		tip.SetToolTip(this, "Оформлять сообщение по Enter (Codex)\nКлик: включить или выключить");
+	}
+
+	protected override bool ShowWithoutActivation {
+		get { return true; }
+	}
+
+	protected override CreateParams CreateParams {
+		get {
+			var result = base.CreateParams;
+			result.ExStyle |= 0x08000000 | 0x00000080 | 0x00000008; // NOACTIVATE, TOOLWINDOW, TOPMOST
+			return result;
+		}
+	}
+
+	protected override void WndProc(ref Message m) {
+		const int WM_MOUSEACTIVATE = 0x21;
+		const int MA_NOACTIVATE = 3;
+		if (m.Msg == WM_MOUSEACTIVATE) {
+			m.Result = (IntPtr)MA_NOACTIVATE;
+			return;
+		}
+		base.WndProc(ref m);
+	}
+
+	public bool On {
+		get { return _on; }
+		set { if (_on != value) { _on = value; Invalidate(); } }
+	}
+
+	// Left of the ✨ button (34 px at 100%, 8 px gap), centred on it.
+	public void Place(Rectangle client, float scale, int right, int bottom) {
+		var size = new Size((int)Math.Round(BaseWidth * scale), (int)Math.Round(BaseHeight * scale));
+		var location = new Point(
+			client.Right - (int)Math.Round((right + 34 + 8) * scale) - size.Width,
+			client.Bottom - (int)Math.Round((bottom + (34 - BaseHeight) / 2) * scale) - size.Height);
+		if (Size != size) {
+			Size = size;
+			// Rounded shape as the window region: no colour key, so no pink fringe.
+			using (var path = Pill(new Rectangle(0, 0, size.Width, size.Height))) {
+				Region = new Region(path);
+			}
+		}
+		if (Location != location) Location = location;
+	}
+
+	static System.Drawing.Drawing2D.GraphicsPath Pill(Rectangle r) {
+		var path = new System.Drawing.Drawing2D.GraphicsPath();
+		var d = r.Height;
+		path.AddArc(r.Left, r.Top, d, d, 90, 180);
+		path.AddArc(r.Right - d, r.Top, d, d, 270, 180);
+		path.CloseFigure();
+		return path;
+	}
+
+	protected override void OnPaint(PaintEventArgs e) {
+		var g = e.Graphics;
+		g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+		g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+		var fill = _on
+			? (_hover ? Color.FromArgb(160, 105, 255) : Color.FromArgb(132, 82, 240))
+			: (_hover ? Color.FromArgb(78, 78, 90) : Color.FromArgb(58, 58, 68));
+		g.Clear(fill);
+		var h = Height;
+		// switch knob: right and white when on, left and grey when off
+		var knob = h - 10;
+		var knobX = _on ? Width - knob - 6 : 6;
+		using (var brush = new SolidBrush(_on ? Color.White : Color.FromArgb(150, 150, 160))) {
+			g.FillEllipse(brush, knobX, 5, knob, knob);
+		}
+		using (var font = new Font("Segoe UI Semibold", h * 0.44f, GraphicsUnit.Pixel))
+		using (var brush = new SolidBrush(_on ? Color.White : Color.FromArgb(200, 200, 210))) {
+			var format = new StringFormat(StringFormatFlags.NoWrap) { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+			var text = _on ? "Оформление ВКЛ" : "Оформление ВЫКЛ";
+			var area = _on ? new RectangleF(4, 0, Width - knob - 12, h) : new RectangleF(knob + 8, 0, Width - knob - 12, h);
+			g.DrawString(text, font, brush, area, format);
+		}
+	}
+
+	protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
+	protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
+
+	protected override void OnMouseUp(MouseEventArgs e) {
+		if (e.Button == MouseButtons.Left && Clicked != null) Clicked();
+		base.OnMouseUp(e);
+	}
+}
+
 // The message field text through UI Automation: no clipboard, no keys,
 // the caret and selection stay as they are.
 public static class FieldReader {
@@ -2195,6 +2306,9 @@ public class TrayApp : ApplicationContext {
 	volatile bool _recording;
 	int _transcribing;
 	IntPtr _micWindow;
+	readonly EnterToggle _toggle;
+	readonly ToolStripMenuItem _onEnter;
+	bool _syncing;
 	readonly System.Windows.Forms.Timer _follow;
 	IntPtr _target;
 	int _busy;
@@ -2210,9 +2324,13 @@ public class TrayApp : ApplicationContext {
 			ContextMenuStrip = new ContextMenuStrip(),
 		};
 		_tray.ContextMenuStrip.Items.Add("\u2728 Кнопка у отправки или Ctrl+Shift+F в AyuGram").Enabled = false;
-		var onEnter = new ToolStripMenuItem("Оформлять при отправке (Enter)") { CheckOnClick = true, Checked = Config.Load().OnEnter };
-		onEnter.CheckedChanged += (s, e) => SaveSetting("on_enter", onEnter.Checked);
-		_tray.ContextMenuStrip.Items.Add(onEnter);
+		_onEnter = new ToolStripMenuItem("Оформлять при отправке (Enter)") { CheckOnClick = true, Checked = Config.Load().OnEnter };
+		_onEnter.CheckedChanged += (s, e) => {
+			if (_syncing) return;
+			SaveSetting("on_enter", _onEnter.Checked);
+			_toggle.On = _onEnter.Checked;
+		};
+		_tray.ContextMenuStrip.Items.Add(_onEnter);
 		_tray.ContextMenuStrip.Items.Add("Настройки", null, (s, e) => OpenFile("ayu_fancy.json"));
 		_tray.ContextMenuStrip.Items.Add("Лог", null, (s, e) => OpenFile("ayu_fancy.log"));
 		_tray.ContextMenuStrip.Items.Add("Выход", null, (s, e) => ExitThread());
@@ -2222,6 +2340,8 @@ public class TrayApp : ApplicationContext {
 		_mic.Moved = (right, bottom) => SaveButtonPlace(right - 40, bottom);
 		_button.Clicked = () => StartRun(_target, Trigger.Button);
 		_button.Moved = SaveButtonPlace;
+		_toggle = new EnterToggle { On = _onEnter.Checked };
+		_toggle.Clicked = ToggleEnter;
 		_follow = new System.Windows.Forms.Timer { Interval = 150 };
 		_follow.Tick += (s, e) => Follow();
 		_follow.Start();
@@ -2450,18 +2570,30 @@ public class TrayApp : ApplicationContext {
 		}
 	}
 
-	// Keeps the button on the active AyuGram window, hides it otherwise.
+	// The pill: formatting on Enter on or off, same setting as the tray item.
+	void ToggleEnter() {
+		var on = !CurrentConfig().OnEnter;
+		SaveSetting("on_enter", on);
+		_syncing = true;
+		_onEnter.Checked = on;
+		_syncing = false;
+		_toggle.On = on;
+		Log.Write("on_enter " + (on ? "on" : "off") + " (pill)");
+		Show(on ? "✨ Оформление по Enter включено" : "Оформление выключено: Enter отправляет как есть", _target, 1800);
+	}
+
+	// Keeps the button and the pill on the active AyuGram window, hides them otherwise.
 	void Follow() {
 		var config = _cfg;
 		if (config == null) return;
 		var foreground = Native.GetForegroundWindow();
-		if (foreground == _button.Handle || foreground == _mic.Handle || _button.Dragging || _mic.Dragging) {
+		if (foreground == _button.Handle || foreground == _mic.Handle || foreground == _toggle.Handle || _button.Dragging || _mic.Dragging) {
 			return;
 		}
 		var window = foreground != IntPtr.Zero ? Native.GetAncestor(foreground, 2) : IntPtr.Zero; // GA_ROOT
 		int appPid;
 		var show = config.Enabled
-			&& config.Button
+			&& (config.Button || config.Toggle || config.Dictation)
 			&& window != IntPtr.Zero
 			&& IsAppWindow(window, out appPid)
 			&& Native.IsWindowVisible(window)
@@ -2469,12 +2601,14 @@ public class TrayApp : ApplicationContext {
 		if (!show) {
 			if (_button.Visible && _busy == 0) _button.Hide();
 			if (_mic.Visible && !_recording) _mic.Hide();
+			if (_toggle.Visible) _toggle.Hide();
 			return;
 		}
 		Native.RECT rect;
 		if (!Native.GetClientRect(window, out rect) || rect.Right < 300 || rect.Bottom < 200) {
 			if (_button.Visible) _button.Hide();
 			if (_mic.Visible && !_recording) _mic.Hide();
+			if (_toggle.Visible) _toggle.Hide();
 			return;
 		}
 		var origin = new Point(0, 0);
@@ -2487,15 +2621,32 @@ public class TrayApp : ApplicationContext {
 		} catch {
 		}
 		_target = window;
-		_button.Client = client;
-		_button.Place(client, scale, config.ButtonRight, config.ButtonBottom);
-		if (!_button.Visible) _button.Show();
+		if (config.Button) {
+			_button.Client = client;
+			_button.Place(client, scale, config.ButtonRight, config.ButtonBottom);
+			if (!_button.Visible) _button.Show();
+		} else if (_button.Visible && _busy == 0) {
+			_button.Hide();
+		}
 		if (config.Dictation) {
 			_mic.Client = client;
 			_mic.Place(client, scale, config.ButtonRight + 40, config.ButtonBottom);
 			if (!_mic.Visible) _mic.Show();
 		} else if (_mic.Visible && !_recording) {
 			_mic.Hide();
+		}
+		if (_onEnter.Checked != config.OnEnter) { // ayu_fancy.json edited by hand
+			_syncing = true;
+			_onEnter.Checked = config.OnEnter;
+			_syncing = false;
+		}
+		if (config.Toggle) {
+			_toggle.On = config.OnEnter;
+			// left of 🎙 when dictation is on, else left of ✨
+			_toggle.Place(client, scale, config.ButtonRight + (config.Dictation ? 40 : 0), config.ButtonBottom);
+			if (!_toggle.Visible) _toggle.Show();
+		} else if (_toggle.Visible) {
+			_toggle.Hide();
 		}
 	}
 
