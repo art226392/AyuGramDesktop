@@ -915,6 +915,18 @@ public static class Engines {
 			"-C", dir, "-o", output,
 		};
 		if (!config.CodexUserConfig) args.Add("--ignore-user-config");
+		// Every tool description goes to the model with each request:
+		// formatting text needs none of them, without them it answers faster.
+		foreach (var feature in new[] {
+				"apps", "browser_use", "browser_use_external", "computer_use",
+				"image_generation", "multi_agent", "plugins", "remote_plugin",
+				"shell_tool", "unified_exec", "view_image", "skill_search",
+				"tool_suggest", "sleep_tool", "goals", "hooks", "in_app_browser",
+				"realtime_conversation", "worktrees", "workspace_dependencies",
+				"unbounded_connection_retries" }) {
+			args.Add("--disable");
+			args.Add(feature);
+		}
 		if (!string.IsNullOrEmpty(config.CodexEffort)) {
 			args.Add("-c");
 			args.Add("model_reasoning_effort=" + config.CodexEffort);
@@ -965,9 +977,9 @@ public static class Engines {
 				process.StandardInput.BaseStream.Write(bytes, 0, bytes.Length);
 				process.StandardInput.BaseStream.Flush();
 				process.StandardInput.Close();
-				if (!process.WaitForExit(120000)) {
+				if (!process.WaitForExit(45000)) {
 					try { process.Kill(); } catch { }
-					answer.Error = "Codex не ответил за 2 минуты";
+					answer.Error = "Codex не ответил за 45 с";
 				} else {
 					process.WaitForExit();
 					if (abort != null) {
@@ -1120,7 +1132,7 @@ public static class Engines {
 
 	// Asks every engine there is, waits a little for the slower one after
 	// the first good answer, returns all answers that came.
-	public static List<Answer> AskAll(Config config, string prompt, int graceMs) {
+	public static List<Answer> AskAll(Config config, string prompt, Func<Answer, bool> good) {
 		var codex = config.Engine != "groq" ? FindCodex(config) : null;
 		var chat = config.Engine != "codex" && !string.IsNullOrEmpty(config.Key);
 		var asks = new List<Func<Answer>>();
@@ -1142,15 +1154,16 @@ public static class Engines {
 				try { answer = call(); } catch (Exception e) { answer = new Answer { Error = e.Message }; }
 				lock (gate) {
 					answers.Add(answer);
-					if (answer.Error.Length == 0 && answer.Text.Length > 0) firstGood.Set();
+					if (answer.Error.Length == 0 && answer.Text.Length > 0 && good(answer)) firstGood.Set();
 					if (--pending == 0) { firstGood.Set(); all.Set(); }
 				}
 			});
 			thread.IsBackground = true;
 			thread.Start();
 		}
+		// A good answer goes in at once, the slower engine is only waited for
+		// when everything that came so far is weak.
 		firstGood.WaitOne();
-		all.WaitOne(graceMs);
 		lock (gate) {
 			return answers.ToList();
 		}
@@ -1166,7 +1179,16 @@ public static class Engines {
 		Candidate best = null;
 		var errors = new List<string>();
 		for (var attempt = 0; attempt < 2; ++attempt) {
-			var answers = AskAll(config, Core.BuildPrompt(html, config.Style, attempt > 0), 2000);
+			Func<Answer, Candidate> judge = (answer) => {
+				int lost;
+				var restored = Core.Restore(Core.FromHtml(Core.CleanAnswer(answer.Text)), items, out lost);
+				if (!Core.LooksSane(source, restored)) return null;
+				return new Candidate { Answer = answer, Text = restored, Lost = lost, Score = Core.Score(source, restored) - lost * 3 };
+			};
+			var answers = AskAll(config, Core.BuildPrompt(html, config.Style, attempt > 0), (answer) => {
+				var candidate = judge(answer);
+				return candidate != null && candidate.Score >= good;
+			});
 			foreach (var answer in answers) {
 				if (answer.Error.Length > 0) {
 					errors.Add(answer.Error);
@@ -1183,7 +1205,7 @@ public static class Engines {
 				if (best == null || candidate.Score > best.Score) best = candidate;
 			}
 			// One more try only when everything was plain and there is time.
-			if (best != null && (best.Score >= good || watch.ElapsedMilliseconds > 6000)) break;
+			if (best != null && (best.Score >= good || watch.ElapsedMilliseconds > 3000)) break;
 			if (best == null && errors.Count > 0 && attempt == 0 && errors.All(e => e.Contains("не найден") || e.Contains("Нет ни"))) break;
 		}
 		result.Milliseconds = watch.ElapsedMilliseconds;
