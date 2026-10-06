@@ -46,6 +46,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "styles/style_iv.h"
 #include "styles/style_layers.h"
 
+// AyuGram includes
+#include "api/api_text_entities.h"
+
 namespace Iv::Editor {
 namespace {
 
@@ -397,6 +400,7 @@ struct State {
 	Ui::SlideWrap<ResponseIsland> *responseWrap = nullptr;
 	Ui::RoundButton *primaryButton = nullptr;
 	Fn<void()> generate;
+	Fn<void(QString, QString)> generatePlain;
 	Fn<void()> rebuildButtons;
 	Fn<void()> rebuildResponseIsland;
 	Fn<void()> enterLoading;
@@ -634,6 +638,63 @@ void CreateAiBox(not_null<Ui::GenericBox*> box, CreateAiBoxArgs &&args) {
 			state->page = Iv::ParseRichPage(
 				state->session,
 				result.data().vresult());
+			state->phase = State::Phase::HasResult;
+			state->rebuildResponseIsland();
+			state->rebuildButtons();
+			state->prompt->clearFocus();
+		}).fail([=](const MTP::Error &error) {
+			state->requestId = 0;
+			state->loading = false;
+			state->phase = state->page
+				? State::Phase::HasResult
+				: State::Phase::Initial;
+			state->rebuildButtons();
+			if (MTP::IgnoreError(error)) {
+				return;
+			}
+			// AyuGram: server refuses rich compose for this client,
+			// generate plain text and wrap it into a page instead.
+			if (error.type() == u"RICH_MESSAGE_UNSUPPORTED"_q) {
+				state->generatePlain(prompt, lang);
+				return;
+			}
+			box->showToast(error.type());
+		}).handleFloodErrors().send();
+	};
+
+	state->generatePlain = [=](QString prompt, QString lang) {
+		state->phase = State::Phase::Loading;
+		state->loading = true;
+		state->enterLoading();
+
+		using Flag = MTPmessages_composeMessageWithAI::Flag;
+		auto flags = MTPmessages_composeMessageWithAI::Flags(0)
+			| Flag::f_tone;
+		if (state->emojify) {
+			flags |= Flag::f_emojify;
+		}
+		if (!lang.isEmpty()) {
+			flags |= Flag::f_translate_to_lang;
+		}
+		const auto instruction = u"The text is a request from the user. "
+			"Do not rewrite it, instead write the requested content "
+			"in full, well structured, split into paragraphs."_q;
+		state->requestId = state->api.request(
+			MTPmessages_ComposeMessageWithAI(
+				MTP_flags(flags),
+				MTP_textWithEntities(
+					MTP_string(prompt),
+					MTP_vector<MTPMessageEntity>()),
+				lang.isEmpty() ? MTPstring() : MTP_string(lang),
+				MTP_inputAiComposeToneSingleUse(MTP_string(instruction)))
+		).done([=](const MTPmessages_ComposedMessageWithAI &result) {
+			state->requestId = 0;
+			state->loading = false;
+			auto text = Api::ParseTextWithEntities(
+				state->session,
+				result.data().vresult_text());
+			state->page = std::make_shared<const RichPage>(
+				Iv::SplitTextIntoRichPage(std::move(text)));
 			state->phase = State::Phase::HasResult;
 			state->rebuildResponseIsland();
 			state->rebuildButtons();
