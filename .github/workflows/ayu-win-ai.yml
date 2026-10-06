@@ -244,18 +244,23 @@ jobs:
           if errorlevel 1 exit /b 1
 
       - name: Package.
-        shell: bash
+        shell: pwsh
         run: |
-          OUT="$TBUILD/$REPO_NAME/out/$BUILD_CONFIG"
-          EXE="$(ls "$OUT"/AyuGram.exe "$OUT"/Telegram.exe 2>/dev/null | head -1)"
-          test -n "$EXE"
-          mkdir -p dist
-          cp "$EXE" dist/AyuGram.exe
-          echo "$GITHUB_SHA" > dist/version.txt
-          (cd dist && 7z a -tzip -mx=7 ../AyuGram-AI-win64.zip AyuGram.exe version.txt)
-          sha256sum AyuGram-AI-win64.zip | awk '{ print $1 }' > AyuGram-AI-win64.zip.sha256
-          cp dist/version.txt version.txt
-          ls -la AyuGram-AI-win64.zip dist
+          $out = "$env:TBUILD\$env:REPO_NAME\out\$env:BUILD_CONFIG"
+          $exe = @("$out\AyuGram.exe", "$out\Telegram.exe") |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $exe) { throw "AyuGram.exe not found in $out" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $exe dist\AyuGram.exe
+          Set-Content dist\version.txt $env:GITHUB_SHA -Encoding ascii
+          Push-Location dist
+          7z a -tzip -mx=7 ..\AyuGram-AI-win64.zip AyuGram.exe version.txt
+          if ($LASTEXITCODE -ne 0) { throw "7z failed" }
+          Pop-Location
+          (Get-FileHash AyuGram-AI-win64.zip -Algorithm SHA256).Hash.ToLower() |
+            Set-Content AyuGram-AI-win64.zip.sha256 -Encoding ascii
+          Copy-Item dist\version.txt version.txt
+          Get-ChildItem AyuGram-AI-win64.zip, dist
 
       - uses: actions/upload-artifact@v4
         name: Upload artifact.
