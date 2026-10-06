@@ -226,8 +226,11 @@ jobs:
         run: |
           cd %TBUILD%\%REPO_NAME%\Telegram
 
+          rem MSBuild runs too many compilers at once and the runner
+          rem runs out of memory ("compiler is out of heap space"),
+          rem Ninja with a fixed job count keeps it in limits.
           call configure.bat ^
-          x64 ^
+          -G "Ninja Multi-Config" ^
           qt6 ^
           -D TDESKTOP_API_ID=%API_ID% ^
           -D TDESKTOP_API_HASH=%API_HASH% ^
@@ -237,7 +240,7 @@ jobs:
           -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
           if errorlevel 1 exit /b 1
 
-          cmake --build ..\out --config %BUILD_CONFIG% --target Telegram --parallel
+          cmake --build ..\out --config %BUILD_CONFIG% --target Telegram --parallel 3
           if errorlevel 1 exit /b 1
 
       - name: Package.
