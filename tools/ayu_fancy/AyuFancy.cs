@@ -21,6 +21,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
+using System.Windows.Automation;
 using System.Windows.Forms;
 
 namespace AyuFancy {
@@ -853,6 +854,12 @@ public class Config {
 	// Enter in AyuGram formats the message first, then sends it.
 	public bool OnEnter = true;
 	public int EnterTimeout = 25;
+	// Enter waits at most this long, then the message goes as typed.
+	public int EnterBudgetMs = 5000;
+	// Codex is preferred; Groq (when there is a key) is taken after this.
+	public int CodexPreferMs = 3500;
+	// Formats in the background while the user pauses typing.
+	public bool Prefetch = true;
 	public bool Button = true;
 	// Button position from the bottom right corner of the AyuGram window,
 	// in pixels at 100% scale: just above the send button by default.
@@ -902,6 +909,9 @@ public class Config {
 					result.Button = Bool(json, "button", true);
 					result.Mode = Str(json, "mode", result.Mode).ToLowerInvariant();
 					result.OnEnter = Bool(json, "on_enter", true);
+					result.Prefetch = Bool(json, "prefetch", true);
+					object budget;
+					if (json.TryGetValue("enter_budget_ms", out budget) && budget is int) result.EnterBudgetMs = Math.Max(1000, (int)budget);
 					object timeout;
 					if (json.TryGetValue("enter_timeout", out timeout) && timeout is int) result.EnterTimeout = Math.Max(3, (int)timeout);
 					object number;
@@ -1221,14 +1231,45 @@ public static class Engines {
 		var prompt = Core.BuildCleanPrompt(Core.ToHtml(prepared), config.Style);
 		Tagged best = null;
 		var errors = new List<string>();
-		// The chosen Codex model answers; Groq only when Codex is missing or failed.
+		// The chosen Codex model is preferred; Groq, when there is a key, runs
+		// alongside and is taken only if Codex is not there in CodexPreferMs.
 		var answers = new List<Answer>();
 		var codex = config.Engine != "groq" ? FindCodex(config) : null;
-		if (codex != null) answers.Add(AskCodex(config, codex, prompt));
-		if ((codex == null || answers[0].Error.Length > 0) && config.Engine != "codex" && !string.IsNullOrEmpty(config.Key)) {
-			answers.Add(AskChat(config, config.Model, prompt));
+		var chat = config.Engine != "codex" && !string.IsNullOrEmpty(config.Key);
+		Answer codexAnswer = null, chatAnswer = null;
+		var codexDone = new ManualResetEvent(codex == null);
+		var chatDone = new ManualResetEvent(!chat);
+		if (codex != null) {
+			var thread = new Thread(() => { codexAnswer = AskCodex(config, codex, prompt); codexDone.Set(); });
+			thread.IsBackground = true;
+			thread.Start();
 		}
-		if (answers.Count == 0) answers.Add(new Answer { Error = "Нет ни Codex, ни ключа Groq, запусти AYU_FANCY.cmd" });
+		if (chat) {
+			var thread = new Thread(() => { chatAnswer = AskChat(config, config.Model, prompt); chatDone.Set(); });
+			thread.IsBackground = true;
+			thread.Start();
+		}
+		if (codex != null && chat) {
+			if (!codexDone.WaitOne(config.CodexPreferMs) || codexAnswer.Error.Length > 0) {
+				// After that: the first good answer from either engine.
+				while (true) {
+					var codexIn = codexDone.WaitOne(0);
+					var chatIn = chatDone.WaitOne(0);
+					if (codexIn && codexAnswer.Error.Length == 0) break;
+					if (chatIn && chatAnswer.Error.Length == 0) break;
+					if (codexIn && chatIn) break;
+					WaitHandle.WaitAny(new WaitHandle[] { codexDone, chatDone }, 50);
+				}
+			}
+		} else {
+			codexDone.WaitOne();
+			chatDone.WaitOne();
+		}
+		if (codexDone.WaitOne(0) && codexAnswer != null) answers.Add(codexAnswer);
+		if (chatDone.WaitOne(0) && chatAnswer != null) answers.Add(chatAnswer);
+		answers = answers.OrderBy(x => x.Error.Length > 0 ? 1 : 0).ToList(); // good first, Codex before Groq
+		if (codex == null && !chat) answers.Add(new Answer { Error = "Нет ни Codex, ни ключа Groq, запусти AYU_FANCY.cmd" });
+		if (answers.Count == 0) answers.Add(new Answer { Error = "нет ответа" });
 		foreach (var answer in answers) {
 			if (answer.Error.Length > 0) { errors.Add(answer.Error); continue; }
 			int lost;
@@ -1599,6 +1640,75 @@ public class SparkButton : Form {
 	}
 }
 
+// The message field text through UI Automation: no clipboard, no keys,
+// the caret and selection stay as they are.
+public static class FieldReader {
+	public static string Read(int pid) {
+		try {
+			var element = AutomationElement.FocusedElement;
+			if (element == null || element.Current.ProcessId != pid) return null;
+			object pattern;
+			string value = null;
+			if (element.TryGetCurrentPattern(ValuePattern.Pattern, out pattern)) {
+				value = ((ValuePattern)pattern).Current.Value;
+			} else if (element.TryGetCurrentPattern(TextPattern.Pattern, out pattern)) {
+				value = ((TextPattern)pattern).DocumentRange.GetText(-1);
+			}
+			return value == null ? null : value.Replace("\r\n", "\n").Replace('\r', '\n');
+		} catch {
+			return null;
+		}
+	}
+}
+
+// Formatting jobs by text: prefetched while typing, picked up on Enter.
+public class Prefetcher {
+	public class Job {
+		public string Text;
+		public ManualResetEvent Done = new ManualResetEvent(false);
+		public Engines.Result Result;
+		public DateTime Started = DateTime.Now;
+	}
+
+	readonly object _lock = new object();
+	readonly List<Job> _jobs = new List<Job>();
+
+	Job Find(string text) {
+		return _jobs.FirstOrDefault(j => j.Text == text);
+	}
+
+	// One background job at a time, so typing does not start a flood.
+	public void Prefetch(string text, Config config) {
+		lock (_lock) {
+			if (Find(text) != null || _jobs.Any(j => !j.Done.WaitOne(0))) return;
+		}
+		Start(text, config);
+	}
+
+	public Job Start(string text, Config config) {
+		Job job;
+		lock (_lock) {
+			job = Find(text);
+			if (job != null) return job;
+			job = new Job { Text = text };
+			_jobs.Add(job);
+			while (_jobs.Count > 6) _jobs.RemoveAt(0);
+		}
+		var thread = new Thread(() => {
+			try {
+				job.Result = Engines.Format(config, new Tagged(text, null));
+			} catch (Exception e) {
+				job.Result = new Engines.Result { Error = e.Message };
+			}
+			Log.Write("job " + (job.Result.Error.Length > 0 ? job.Result.Error : "ok") + " in " + job.Result.Milliseconds + " ms");
+			job.Done.Set();
+		});
+		thread.IsBackground = true;
+		thread.Start();
+		return job;
+	}
+}
+
 public class TrayApp : ApplicationContext {
 	readonly NotifyIcon _tray;
 	readonly Osd _osd;
@@ -1608,8 +1718,6 @@ public class TrayApp : ApplicationContext {
 	readonly SparkButton _button;
 	readonly System.Windows.Forms.Timer _follow;
 	IntPtr _target;
-	Config _config;
-	DateTime _configTime;
 	int _busy;
 
 	public TrayApp() {
@@ -1635,6 +1743,11 @@ public class TrayApp : ApplicationContext {
 		_follow = new System.Windows.Forms.Timer { Interval = 150 };
 		_follow.Tick += (s, e) => Follow();
 		_follow.Start();
+		_cfg = Config.Load();
+		var background = new Thread(Background);
+		background.IsBackground = true;
+		background.SetApartmentState(ApartmentState.MTA);
+		background.Start();
 		_proc = HookCallback;
 		_hook = Native.SetWindowsHookEx(13, _proc, Native.GetModuleHandle(null), 0);
 		Log.Write("started, hook " + (_hook != IntPtr.Zero ? "ok" : "FAILED " + Marshal.GetLastWin32Error()));
@@ -1686,41 +1799,43 @@ public class TrayApp : ApplicationContext {
 		return name;
 	}
 
+	// Runs for every key press in the whole system: memory reads only, no
+	// files, no process lookups, no waiting. Anything slow here lags the
+	// keyboard everywhere.
 	IntPtr HookCallback(int code, IntPtr wParam, IntPtr lParam) {
 		if (code >= 0 && (wParam == (IntPtr)0x100 || wParam == (IntPtr)0x104)) {
 			var key = Marshal.ReadInt32(lParam);
 			var flags = Marshal.ReadInt32(lParam, 8);
 			var injected = (flags & 0x10) != 0;
-			if (!injected && key == Native.VK_ESCAPE && _enterRun) {
-				_sendAsIs.Set(); // Esc while formatting on Enter: send as typed
+			var config = _cfg;
+			if (injected || config == null || !config.Enabled) {
+				return Native.CallNextHookEx(_hook, code, wParam, lParam);
+			}
+			if (_enterRun && (key == Native.VK_ESCAPE || key == Native.VK_RETURN)) {
+				_sendAsIs.Set(); // Esc or a second Enter: send as typed now
 				return (IntPtr)1;
 			}
-			if (!injected
-				&& key == Native.VK_RETURN
-				&& !Native.Down(Native.VK_SHIFT)
+			var plain = !Native.Down(Native.VK_SHIFT)
 				&& !Native.Down(Native.VK_CONTROL)
 				&& !Native.Down(Native.VK_MENU)
 				&& !Native.Down(Native.VK_LWIN)
-				&& !Native.Down(Native.VK_RWIN)) {
+				&& !Native.Down(Native.VK_RWIN);
+			if (key == Native.VK_RETURN && plain && config.OnEnter && _busy == 0) {
 				var window = Native.GetForegroundWindow();
-				var config = CurrentConfig();
-				if (config.Enabled && config.OnEnter && config.Apps.Contains(ProcessName(window))) {
-					if (_busy == 0) StartRun(window, Trigger.Enter);
+				int pid;
+				if (IsAppWindow(window, out pid)) {
+					StartRun(window, Trigger.Enter, pid);
 					return (IntPtr)1;
 				}
 			}
-			if (!injected
-				&& key == Native.VK_F
+			if (key == Native.VK_F
 				&& Native.Down(Native.VK_CONTROL)
 				&& Native.Down(Native.VK_SHIFT)
-				&& !Native.Down(Native.VK_MENU)
-				&& !Native.Down(Native.VK_LWIN)
-				&& !Native.Down(Native.VK_RWIN)) {
+				&& !Native.Down(Native.VK_MENU)) {
 				var window = Native.GetForegroundWindow();
-				var name = ProcessName(window);
-				var config = Config.Load();
-				if (config.Enabled && config.Apps.Contains(name)) {
-					StartRun(window, Trigger.Hotkey);
+				int pid;
+				if (IsAppWindow(window, out pid)) {
+					StartRun(window, Trigger.Hotkey, pid);
 					return (IntPtr)1;
 				}
 			}
@@ -1728,25 +1843,95 @@ public class TrayApp : ApplicationContext {
 		return Native.CallNextHookEx(_hook, code, wParam, lParam);
 	}
 
-	Config CurrentConfig() {
-		if (_config == null || (DateTime.Now - _configTime).TotalSeconds > 3) {
-			_config = Config.Load();
-			_configTime = DateTime.Now;
-		}
-		return _config;
+	// Cached only: names are looked up by the background thread.
+	bool IsAppWindow(IntPtr window, out int pid) {
+		uint id;
+		Native.GetWindowThreadProcessId(window, out id);
+		pid = (int)id;
+		var apps = _appPids;
+		return apps != null && apps.Contains(pid);
 	}
+
+	Config CurrentConfig() {
+		return _cfg ?? Config.Load();
+	}
+
+	volatile Config _cfg;
+	volatile HashSet<int> _appPids = new HashSet<int>();
+
+	// Background: settings, which processes are AyuGram, and prefetching the
+	// formatted text while the user pauses typing.
+	void Background() {
+		var lastConfig = DateTime.MinValue;
+		var lastApps = DateTime.MinValue;
+		string lastText = null;
+		var changedAt = DateTime.Now;
+		while (true) {
+			try {
+				Thread.Sleep(250);
+				var now = DateTime.Now;
+				if ((now - lastConfig).TotalSeconds >= 2 || _cfg == null) {
+					_cfg = Config.Load();
+					lastConfig = now;
+				}
+				var config = _cfg;
+				if ((now - lastApps).TotalSeconds >= 3) {
+					var pids = new HashSet<int>();
+					foreach (var process in Process.GetProcesses()) {
+						try {
+							if (config.Apps.Contains(process.ProcessName.ToLowerInvariant())) pids.Add(process.Id);
+						} catch {
+						}
+						process.Dispose();
+					}
+					_appPids = pids;
+					lastApps = now;
+				}
+				if (!config.Enabled || !config.OnEnter || !config.Prefetch || _enterRun) continue;
+				int pid;
+				var window = Native.GetForegroundWindow();
+				if (!IsAppWindow(window, out pid)) continue;
+				var text = FieldReader.Read(pid);
+				if (text == null) continue;
+				if (text != lastText) {
+					lastText = text;
+					changedAt = now;
+					continue;
+				}
+				if ((now - changedAt).TotalMilliseconds >= 900 && Worth(text)) {
+					_pre.Prefetch(text, config);
+				}
+			} catch (Exception e) {
+				Log.Write("background: " + e.Message);
+			}
+		}
+	}
+
+	static bool Worth(string text) {
+		return HasWords(text, 2) && text.IndexOf('\uFFFC') < 0 && text.Length < 4000;
+	}
+
+	readonly Prefetcher _pre = new Prefetcher();
 
 	public enum Trigger { Hotkey, Button, Enter }
 	volatile bool _enterRun;
 	readonly ManualResetEvent _sendAsIs = new ManualResetEvent(false);
 
 	void StartRun(IntPtr window, Trigger trigger) {
+		StartRun(window, trigger, 0);
+	}
+
+	void StartRun(IntPtr window, Trigger trigger, int pid) {
 		if (window == IntPtr.Zero || Interlocked.CompareExchange(ref _busy, 1, 0) != 0) {
 			return;
 		}
+		if (trigger == Trigger.Enter) {
+			_enterRun = true;
+			_sendAsIs.Reset();
+		}
 		SetBusy(true);
 		var thread = new Thread(() => {
-			if (trigger == Trigger.Enter) RunEnter(window);
+			if (trigger == Trigger.Enter) RunEnter(window, pid);
 			else Run(window, trigger == Trigger.Hotkey);
 		});
 		thread.SetApartmentState(ApartmentState.STA);
@@ -1763,16 +1948,18 @@ public class TrayApp : ApplicationContext {
 
 	// Keeps the button on the active AyuGram window, hides it otherwise.
 	void Follow() {
-		var config = CurrentConfig();
+		var config = _cfg;
+		if (config == null) return;
 		var foreground = Native.GetForegroundWindow();
 		if (foreground == _button.Handle || _button.Dragging) {
 			return;
 		}
 		var window = foreground != IntPtr.Zero ? Native.GetAncestor(foreground, 2) : IntPtr.Zero; // GA_ROOT
+		int appPid;
 		var show = config.Enabled
 			&& config.Button
 			&& window != IntPtr.Zero
-			&& config.Apps.Contains(ProcessName(window))
+			&& IsAppWindow(window, out appPid)
 			&& Native.IsWindowVisible(window)
 			&& !Native.IsIconic(window);
 		if (!show) {
@@ -1809,7 +1996,7 @@ public class TrayApp : ApplicationContext {
 			if (json == null) json = new Dictionary<string, object>();
 			json[name] = value;
 			File.WriteAllText(path, serializer.Serialize(json), new UTF8Encoding(false));
-			_config = null;
+			_cfg = Config.Load();
 		} catch (Exception e) {
 			Log.Write("setting not saved: " + e.Message);
 		}
@@ -1826,7 +2013,7 @@ public class TrayApp : ApplicationContext {
 			json["button_right"] = right;
 			json["button_bottom"] = bottom;
 			File.WriteAllText(path, serializer.Serialize(json), new UTF8Encoding(false));
-			_config = null;
+			_cfg = Config.Load();
 			Log.Write("button moved to " + right + "," + bottom);
 		} catch (Exception e) {
 			Log.Write("button place not saved: " + e.Message);
@@ -1993,64 +2180,79 @@ public class TrayApp : ApplicationContext {
 		return Regex.Matches(text, "[\\p{L}\\p{N}]+").Count >= count;
 	}
 
-	// Enter in AyuGram: format the whole message, then send it. Esc sends it
-	// as typed; any failure or timeout sends it as typed too.
-	void RunEnter(IntPtr window) {
+	// Enter in AyuGram: the message goes out within EnterBudgetMs, formatted
+	// if the formatting is ready by then (usually prefetched while typing),
+	// as typed otherwise. The field is not touched while waiting.
+	void RunEnter(IntPtr window, int pid) {
 		string saved = null;
-		_sendAsIs.Reset();
-		_enterRun = true;
+		var savedTaken = false;
+		var watch = Stopwatch.StartNew();
 		try {
-			saved = Retry<string>(() => Clipboard.ContainsText() ? Clipboard.GetText() : null, null);
-			var source = CopyFromField(true);
-			// Search boxes, single words, stickers, empty field: Enter as usual.
-			if (source == null || !HasWords(source.Text, 2)) {
-				Native.Tap(Native.VK_RETURN);
-				return;
-			}
 			var config = CurrentConfig();
-			Show("\u2728 Оформляю и отправляю\u2026  Esc: отправить как есть", window, 0);
-			Engines.Result result = null;
-			var worker = new Thread(() => {
-				try { result = Engines.Format(config, source); } catch (Exception e) { result = new Engines.Result { Error = e.Message }; }
-			});
-			worker.IsBackground = true;
-			worker.Start();
-			var deadline = DateTime.Now.AddSeconds(config.EnterTimeout);
-			while (worker.IsAlive && DateTime.Now < deadline && !_sendAsIs.WaitOne(30)) {
+			var text = FieldReader.Read(pid);
+			var viaUia = text != null;
+			if (!viaUia) {
+				// No UI Automation: copy the field, the old way.
+				saved = Retry<string>(() => Clipboard.ContainsText() ? Clipboard.GetText() : null, null);
+				savedTaken = true;
+				var copied = CopyFromField(true);
+				text = copied != null ? copied.Text : null;
 			}
-			var asIs = _sendAsIs.WaitOne(0);
-			if (Native.GetForegroundWindow() != window) {
-				Show("\u2728 Окно сменилось, не отправил", window, 4000);
-				return;
-			}
-			var now = CopyFromField(true);
-			if (!Same(now, source)) {
-				Show("\u2728 Текст поменялся, пока оформлял. Жми Enter ещё раз", window, 5000);
-				return;
-			}
-			if (asIs || worker.IsAlive || result == null || result.Error.Length > 0 || result.Text == null) {
-				var reason = asIs ? "Esc" : worker.IsAlive ? ("дольше " + config.EnterTimeout + " с") : (result == null ? "нет ответа" : result.Error);
+			if (text == null || !Worth(text)) {
 				Native.Tap(Native.VK_RETURN);
-				Show("\u2728 Отправил как есть: " + reason, window, 4000);
 				return;
+			}
+			var job = _pre.Start(text, config);
+			var shown = false;
+			while (!job.Done.WaitOne(25)) {
+				if (_sendAsIs.WaitOne(0) || watch.ElapsedMilliseconds >= config.EnterBudgetMs - 150) break;
+				if (!shown && watch.ElapsedMilliseconds > 500) {
+					Show("\u2728 Оформляю\u2026  Enter или Esc: отправить как есть", window, 0);
+					shown = true;
+				}
+			}
+			var result = job.Done.WaitOne(0) ? job.Result : null;
+			if (Native.GetForegroundWindow() != window) {
+				Show("\u2728 Окно сменилось, не отправил", window, 3000);
+				return;
+			}
+			if (viaUia && FieldReader.Read(pid) != text) {
+				Show("\u2728 Текст поменялся, жми Enter ещё раз", window, 3000);
+				return;
+			}
+			var ok = result != null && result.Error.Length == 0 && result.Text != null;
+			if (!ok) {
+				Native.Tap(Native.VK_RETURN);
+				if (shown) {
+					var reason = _sendAsIs.WaitOne(0) ? "по твоей команде" : result == null ? ("не успел за " + (config.EnterBudgetMs / 1000.0).ToString("0.#") + " с") : result.Error;
+					Show("\u2728 Отправил как есть: " + reason, window, 2500);
+				}
+				return;
+			}
+			if (result.Text.Text == text && result.Text.Tags.Count == 0) {
+				Native.Tap(Native.VK_RETURN); // nothing to change
+				return;
+			}
+			if (!savedTaken) {
+				saved = Retry<string>(() => Clipboard.ContainsText() ? Clipboard.GetText() : null, null);
+				savedTaken = true;
 			}
 			WriteClipboard(result.Text);
 			Native.Press(Native.VK_CONTROL, 'A');
-			Thread.Sleep(40);
+			Thread.Sleep(30);
 			Native.Press(Native.VK_CONTROL, 'V');
-			Thread.Sleep(150);
+			Thread.Sleep(120);
 			Native.Tap(Native.VK_RETURN);
-			Show(string.Format("\u2728 Оформил и отправил ({0}, {1:0.0} с)", result.Engine, result.Milliseconds / 1000.0), window, 2500);
-			// The message is sent, the user's clipboard can come back now.
-			Thread.Sleep(1500);
+			Show(string.Format("\u2728 {0:0.0} с", watch.ElapsedMilliseconds / 1000.0), window, 1200);
+			Thread.Sleep(600);
 		} catch (Exception e) {
 			Log.Write("enter failed: " + e);
-			Show("\u2728 Ошибка, не отправил: " + e.Message, window, 5000);
+			try { Native.Tap(Native.VK_RETURN); } catch { }
 		} finally {
-			var text = saved;
-			RetryDo(() => {
-				if (text != null) Clipboard.SetText(text);
-			});
+			if (savedTaken) {
+				var text = saved;
+				RetryDo(() => { if (text != null) Clipboard.SetText(text); });
+			}
 			_enterRun = false;
 			Interlocked.Exchange(ref _busy, 0);
 			SetBusy(false);
