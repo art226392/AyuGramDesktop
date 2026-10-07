@@ -877,6 +877,8 @@ public class Config {
 	// Groq gpt-oss reasoning: "medium" edits noticeably better than "low"
 	// and still answers in about 1.5 s; "high" takes 3-6 s.
 	public string GroqEffort = "medium";
+	// Groq models tried in turn when the main one hits its free limit.
+	public string[] GroqSpare = { "qwen/qwen3.8-27b", "openai/gpt-oss-20b" };
 	// Formats in the background while the user pauses typing.
 	public bool Prefetch = true;
 	// Keep one warm `codex app-server` instead of `codex exec` per message.
@@ -933,6 +935,8 @@ public class Config {
 					result.BaseUrl = Str(json, "base_url", result.BaseUrl).TrimEnd('/');
 					result.Model = Str(json, "model", result.Model);
 					result.GroqEffort = Str(json, "groq_effort", result.GroqEffort).ToLowerInvariant();
+					var spare = Str(json, "groq_spare", null);
+					if (spare != null) result.GroqSpare = spare.Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries);
 					result.Style = Str(json, "style", result.Style);
 					result.Button = Bool(json, "button", true);
 					result.Toggle = Bool(json, "toggle", true);
@@ -1616,13 +1620,98 @@ public static class Engines {
 		return answer;
 	}
 
+	// Free Groq gives every model its own 200K tokens a day and 8K a minute.
+	// On 07.10 at 10:00 gpt-oss-120b ran out for the day and every message
+	// waited 4-7 s for Codex. Now a model that hit its limit rests until
+	// Groq says, and the next one answers: 120b, then Qwen (no reasoning,
+	// edits as well, ~600 tokens a message), then gpt-oss-20b.
+	static readonly object CoolGate = new object();
+	static readonly Dictionary<string, DateTime> CoolUntil = new Dictionary<string, DateTime>();
+
+	public static List<string> GroqChain(Config config) {
+		var chain = new List<string> { config.Model };
+		foreach (var model in config.GroqSpare) {
+			if (!string.IsNullOrWhiteSpace(model) && !chain.Contains(model.Trim())) chain.Add(model.Trim());
+		}
+		return chain;
+	}
+
+	// "Please try again in 6.99s" / "in 13m5.2s" / "in 1h2m3s": how long the model rests.
+	public static TimeSpan RetryAfter(string message) {
+		var match = Regex.Match(message ?? "", "try again in (?:(\\d+)h)?(?:(\\d+)m)?(?:([\\d.]+)s)?");
+		var seconds = 60.0;
+		if (match.Success && match.Length > "try again in ".Length) {
+			seconds = 0;
+			if (match.Groups[1].Success) seconds += 3600 * int.Parse(match.Groups[1].Value);
+			if (match.Groups[2].Success) seconds += 60 * int.Parse(match.Groups[2].Value);
+			if (match.Groups[3].Success) seconds += double.Parse(match.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture);
+		}
+		return TimeSpan.FromSeconds(Math.Max(5, Math.Min(seconds + 1, 6 * 3600)));
+	}
+
 	public static Answer AskChat(Config config, string model, string prompt) {
+		var chain = GroqChain(config);
+		if (!chain.Contains(model)) chain.Insert(0, model);
+		Answer last = null;
+		foreach (var name in chain) {
+			lock (CoolGate) {
+				DateTime until;
+				if (CoolUntil.TryGetValue(name, out until) && DateTime.Now < until) continue;
+			}
+			int status;
+			string message;
+			last = AskChatModel(config, name, prompt, out status, out message);
+			if (last.Error.Length == 0) return last;
+			if (status != 429) return last;
+			var rest = RetryAfter(message);
+			lock (CoolGate) CoolUntil[name] = DateTime.Now + rest;
+			Log.Write("groq " + name + " rests " + (int)rest.TotalSeconds + " s, next model");
+		}
+		return last ?? new Answer { Engine = "Groq", Error = "Groq: все модели на лимите, подожди" };
+	}
+
+	// Keeps the HTTPS connection to Groq open while AyuGram is in front: on
+	// 07.10 a round trip to Groq took 0.9 s (Google 0.05 s), a new connection
+	// costs three of them (TCP, TLS, Expect: 100-continue) before the question.
+	static DateTime _groqWarmAt = DateTime.MinValue;
+	static int _groqWarming;
+
+	public static void TuneNet() {
+		ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+		ServicePointManager.Expect100Continue = false;
+		ServicePointManager.MaxServicePointIdleTime = 300000;
+	}
+
+	public static void WarmGroq(Config config) {
+		if (string.IsNullOrEmpty(config.Key) || (DateTime.Now - _groqWarmAt).TotalSeconds < 20) return;
+		if (Interlocked.Exchange(ref _groqWarming, 1) == 1) return;
+		_groqWarmAt = DateTime.Now;
+		ThreadPool.QueueUserWorkItem(_ => {
+			try {
+				TuneNet();
+				var request = (HttpWebRequest)WebRequest.Create(config.BaseUrl + "/models");
+				request.Headers["Authorization"] = "Bearer " + config.Key;
+				request.KeepAlive = true;
+				request.Timeout = 15000;
+				using (var response = (HttpWebResponse)request.GetResponse())
+				using (var reader = new StreamReader(response.GetResponseStream())) {
+					reader.ReadToEnd();
+				}
+			} catch {
+			} finally {
+				Interlocked.Exchange(ref _groqWarming, 0);
+			}
+		});
+	}
+
+	static Answer AskChatModel(Config config, string model, string prompt, out int status, out string message) {
 		var answer = new Answer { Engine = "Groq" };
-		var status = 0;
-		var message = "";
+		status = 0;
+		message = "";
 		try {
-			ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+			TuneNet();
 			var request = (HttpWebRequest)WebRequest.Create(config.BaseUrl + "/chat/completions");
+			request.KeepAlive = true;
 			request.Method = "POST";
 			request.ContentType = "application/json";
 			request.Headers["Authorization"] = "Bearer " + config.Key;
@@ -1633,7 +1722,9 @@ public static class Engines {
 				{ "temperature", 0.4 },
 				{ "messages", new object[] { new Dictionary<string, object> { { "role", "user" }, { "content", prompt } } } },
 			};
-			if (model.Contains("gpt-oss") && config.GroqEffort.Length > 0) body["reasoning_effort"] = config.GroqEffort;
+			if (model == config.Model && model.Contains("gpt-oss") && config.GroqEffort.Length > 0) body["reasoning_effort"] = config.GroqEffort;
+			else if (model.Contains("gpt-oss")) body["reasoning_effort"] = "low";
+			else if (model.Contains("qwen")) body["reasoning_effort"] = "none";
 			var bytes = Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(body));
 			using (var stream = request.GetRequestStream()) {
 				stream.Write(bytes, 0, bytes.Length);
@@ -1657,6 +1748,7 @@ public static class Engines {
 			if (status == 200 && json != null && json.ContainsKey("choices")) {
 				var choice = ((object[])json["choices"])[0] as Dictionary<string, object>;
 				var content = (choice["message"] as Dictionary<string, object>)["content"] as string;
+				if (content != null) content = Regex.Replace(content, "^\\s*<think>[\\s\\S]*?</think>", "");
 				if (!string.IsNullOrWhiteSpace(content)) {
 					answer.Text = content.Trim();
 					return answer;
@@ -1671,7 +1763,7 @@ public static class Engines {
 		}
 		Log.Write("chat " + model + " " + status + ": " + message);
 		if ((status == 404 || status == 400) && message.IndexOf("model", StringComparison.OrdinalIgnoreCase) >= 0 && model != "llama-3.3-70b-versatile") {
-			return AskChat(config, "llama-3.3-70b-versatile", prompt);
+			return AskChatModel(config, "llama-3.3-70b-versatile", prompt, out status, out message);
 		}
 		answer.Error = status == 401 ? "Groq: ключ не подходит" : status != 0 ? ("Groq: ошибка " + status) : "Groq: нет сети";
 		return answer;
@@ -2580,6 +2672,10 @@ public class TrayApp : ApplicationContext {
 					lastWarm = now;
 					var codex = Engines.FindCodex(config);
 					if (codex != null) CodexServer.Warm(config, codex);
+				}
+				if (config.Enabled && config.Engine != "codex") {
+					int warmPid;
+					if (IsAppWindow(Native.GetForegroundWindow(), out warmPid)) Engines.WarmGroq(config);
 				}
 				if ((now - lastApps).TotalSeconds >= 3) {
 					var pids = new HashSet<int>();
