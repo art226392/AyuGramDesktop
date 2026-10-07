@@ -651,19 +651,22 @@ public static class Core {
 	// Clean mode: a careful copy editor, not a designer.
 	public static string BuildCleanPrompt(string html, string extra) {
 		var result = new StringBuilder();
-		result.Append("You are a careful copy editor for Telegram messages. Return the same message, cleaned up:\n");
-		result.Append("- Correct capitalization and punctuation: commas, periods, question marks, dashes, «» quotes for Russian. Fix obvious typos.\n");
-		result.Append("- Readable whitespace: split a long message into short paragraphs with an empty line (<br><br>) between them.\n");
+		result.Append("You are a sharp, careful copy editor for Telegram messages. Return the same message, cleaned up so it reads like a literate native speaker typed it carefully:\n");
+		result.Append("- Correct capitalization and punctuation: commas before subordinate clauses and around introductory words, periods, question marks on real questions, dashes, «» quotes for Russian. Fix obvious typos and agreement errors.\n");
+		result.Append("- Proper nouns and brand names get capitals (Слава, ПК, Telegram); casual slang words stay as they are (телега, пж, норм, ок).\n");
+		result.Append("- Readable whitespace: split a long message into short paragraphs by meaning with an empty line (<br><br>) between them; a short message stays one paragraph.\n");
+		result.Append("- When the author enumerates (во-первых / во-вторых, first / second, 1 2 3), put each point on its own line with a single <br>.\n");
 		result.Append("- <i>Italics</i> sparingly, only where emphasis, a term, a title or an aside really fits.\n");
 		result.Append("- Only a long message with clearly different parts gets headings: <h1>, <h2>, <h3> on their own lines.\n");
-		result.Append("- No bold, no emoji, no lists unless the author already enumerates, no underline, no spoilers.\n");
+		result.Append("- No bold, no emoji, no new lists, no underline, no spoilers.\n");
 		result.Append("- Keep every word, the order, the author's voice, slang and profanity. Do not rephrase, shorten, add or translate anything.\n");
-		result.Append("- Keep links as <a href=\"...\">text</a>, commands and codes as <code>...</code>. Tokens like \u27E61\u27E7 are custom emoji or mentions: copy each unchanged.\n");
+		result.Append("- Keep links as <a href=\"...\">text</a>, commands and codes as <code>...</code>. Tokens like ⟦1⟧ are custom emoji or mentions: copy each unchanged.\n");
 		result.Append("- Output Telegram HTML only (<i> <h1> <h2> <h3> <code> <a> <br>), the message only, no explanations, no ``` fences. Do not run any commands or tools.\n");
 		if (!string.IsNullOrWhiteSpace(extra)) {
 			result.Append("- Author's own wishes: " + extra.Trim() + "\n");
 		}
-		result.Append("\nExample\nMessage:\n<<<\nкороче я вчера доделал бота он теперь сам режет видео в кружки осталось звук починить но это мелочи\n>>>\nAnswer:\nКороче, я вчера доделал бота: он теперь сам режет видео в кружки.<br><br>Осталось звук починить, <i>но это мелочи</i>.\n\n");
+		result.Append("\nExample 1\nMessage:\n<<<\nкороче я вчера доделал бота он теперь сам режет видео в кружки осталось звук починить но это мелочи\n>>>\nAnswer:\nКороче, я вчера доделал бота: он теперь сам режет видео в кружки.<br><br>Осталось звук починить, <i>но это мелочи</i>.\n\n");
+		result.Append("Example 2\nMessage:\n<<<\nслав глянь пж логи там опять ошибка во первых бот не отвечает во вторых телега тупит. ты когда будешь\n>>>\nAnswer:\nСлав, глянь, пж, логи: там опять ошибка.<br><br>Во-первых, бот не отвечает.<br>Во-вторых, телега тупит.<br><br>Ты когда будешь?\n\n");
 		result.Append("Now the real message.\nMessage:\n<<<\n" + html + "\n>>>\nAnswer:\n");
 		return result.ToString();
 	}
@@ -868,8 +871,12 @@ public class Config {
 	public int EnterTimeout = 25;
 	// Enter waits at most this long, then the message goes as typed.
 	public int EnterBudgetMs = 5000;
-	// Codex is preferred; Groq (when there is a key) is taken after this.
-	public int CodexPreferMs = 3500;
+	// Codex waits this long before Groq's answer is taken. 0: the first good
+	// answer wins; `codex exec` takes 4-13 s, Groq about 1.5 s.
+	public int CodexPreferMs = 0;
+	// Groq gpt-oss reasoning: "medium" edits noticeably better than "low"
+	// and still answers in about 1.5 s; "high" takes 3-6 s.
+	public string GroqEffort = "medium";
 	// Formats in the background while the user pauses typing.
 	public bool Prefetch = true;
 	// Keep one warm `codex app-server` instead of `codex exec` per message.
@@ -925,6 +932,7 @@ public class Config {
 					result.Key = Str(json, "key", result.Key);
 					result.BaseUrl = Str(json, "base_url", result.BaseUrl).TrimEnd('/');
 					result.Model = Str(json, "model", result.Model);
+					result.GroqEffort = Str(json, "groq_effort", result.GroqEffort).ToLowerInvariant();
 					result.Style = Str(json, "style", result.Style);
 					result.Button = Bool(json, "button", true);
 					result.Toggle = Bool(json, "toggle", true);
@@ -937,6 +945,8 @@ public class Config {
 					result.Dictation = Bool(json, "dictation", true);
 					object budget;
 					if (json.TryGetValue("enter_budget_ms", out budget) && budget is int) result.EnterBudgetMs = Math.Max(1000, (int)budget);
+					object prefer;
+					if (json.TryGetValue("codex_prefer_ms", out prefer) && prefer is int) result.CodexPreferMs = Math.Max(0, (int)prefer);
 					object timeout;
 					if (json.TryGetValue("enter_timeout", out timeout) && timeout is int) result.EnterTimeout = Math.Max(3, (int)timeout);
 					object number;
@@ -1623,7 +1633,7 @@ public static class Engines {
 				{ "temperature", 0.4 },
 				{ "messages", new object[] { new Dictionary<string, object> { { "role", "user" }, { "content", prompt } } } },
 			};
-			if (model.Contains("gpt-oss")) body["reasoning_effort"] = "low";
+			if (model.Contains("gpt-oss") && config.GroqEffort.Length > 0) body["reasoning_effort"] = config.GroqEffort;
 			var bytes = Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(body));
 			using (var stream = request.GetRequestStream()) {
 				stream.Write(bytes, 0, bytes.Length);
@@ -1734,8 +1744,8 @@ public static class Engines {
 		var prompt = Core.BuildCleanPrompt(html, config.Style);
 		Tagged best = null;
 		var errors = new List<string>();
-		// The chosen Codex model is preferred; Groq, when there is a key, runs
-		// alongside and is taken only if Codex is not there in CodexPreferMs.
+		// Codex and Groq run side by side; Groq's answer is taken once Codex
+		// is not there in CodexPreferMs (0 by default: first good answer wins).
 		var answers = new List<Answer>();
 		var codex = config.Engine != "groq" ? FindCodex(config) : null;
 		var chat = config.Engine != "codex" && !string.IsNullOrEmpty(config.Key);
@@ -2672,14 +2682,14 @@ public class TrayApp : ApplicationContext {
 			&& !Native.IsIconic(window);
 		if (!show) {
 			if (_button.Visible && _busy == 0) _button.Hide();
-			if (_mic.Visible && !_recording) _mic.Hide();
+			if (_mic.Visible) _mic.Hide(); // красная кнопка записи не торчит поверх чужих окон
 			if (_toggle.Visible) _toggle.Hide();
 			return;
 		}
 		Native.RECT rect;
 		if (!Native.GetClientRect(window, out rect) || rect.Right < 300 || rect.Bottom < 200) {
 			if (_button.Visible) _button.Hide();
-			if (_mic.Visible && !_recording) _mic.Hide();
+			if (_mic.Visible) _mic.Hide(); // красная кнопка записи не торчит поверх чужих окон
 			if (_toggle.Visible) _toggle.Hide();
 			return;
 		}
