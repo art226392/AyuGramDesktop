@@ -1171,8 +1171,32 @@ public class CodexServer {
 		return codex + "|" + config.CodexModel + "|" + config.CodexEffort + "|" + config.Style;
 	}
 
+	// After a failure the server rests for a while and `codex exec` answers:
+	// before, a broken server was relaunched every 10 s all day (1384 times
+	// on 06.10), and each Ask waited 20 s for thread/start first.
+	static readonly object PauseGate = new object();
+	static DateTime _pausedUntil = DateTime.MinValue;
+	const int PauseMinutes = 30;
+
+	public static bool Paused {
+		get { lock (PauseGate) return DateTime.Now < _pausedUntil; }
+	}
+
+	public static void Pause(string why) {
+		lock (PauseGate) {
+			if (DateTime.Now < _pausedUntil) return;
+			_pausedUntil = DateTime.Now.AddMinutes(PauseMinutes);
+		}
+		Log.Write("codex server paused for " + PauseMinutes + " min: " + why);
+		lock (Gate) {
+			if (_current != null) _current.Stop();
+			_current = null;
+		}
+	}
+
 	// Starts (or reuses) the server and keeps a spare thread ready.
 	public static CodexServer Get(Config config, string codex) {
+		if (Paused) throw new Exception("на паузе после сбоя");
 		var signature = SignatureOf(config, codex);
 		lock (Gate) {
 			if (_current != null && _current.Alive && _current._signature == signature) {
@@ -1180,7 +1204,13 @@ public class CodexServer {
 			}
 			if (_current != null) _current.Stop();
 			_current = null;
-			var server = new CodexServer(config, codex, signature);
+			CodexServer server;
+			try {
+				server = new CodexServer(config, codex, signature);
+			} catch (Exception e) {
+				ThreadPool.QueueUserWorkItem(_ => Pause(e.Message));
+				throw;
+			}
 			_current = server;
 			server.PrepareSpare();
 			return server;
@@ -1188,6 +1218,7 @@ public class CodexServer {
 	}
 
 	public static void Warm(Config config, string codex) {
+		if (Paused) return;
 		try {
 			Get(config, codex);
 		} catch (Exception e) {
@@ -1356,6 +1387,7 @@ public class CodexServer {
 				lock (_spare) _spare.Enqueue(id);
 			} catch (Exception e) {
 				Log.Write("spare thread: " + e.Message);
+				Pause("spare thread: " + e.Message);
 			} finally {
 				lock (_spare) _spareStarting = false;
 			}
@@ -1419,7 +1451,7 @@ public static class Engines {
 
 	// Warm server first, the one-shot `codex exec` when the server can't run.
 	public static Answer AskCodexFast(Config config, string codex, string html) {
-		if (config.CodexServer) {
+		if (config.CodexServer && !CodexServer.Paused) {
 			try {
 				var server = CodexServer.Get(config, codex);
 				var answer = server.Ask(Core.CleanInput(html), 45000);
@@ -1428,6 +1460,7 @@ public static class Engines {
 				return answer;
 			} catch (Exception e) {
 				Log.Write("codex server failed: " + e.Message);
+				CodexServer.Pause(e.Message);
 			}
 		}
 		return AskCodex(config, codex, Core.BuildCleanPrompt(html, config.Style));
@@ -1930,6 +1963,28 @@ public static class Native {
 
 	public delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
 
+	[StructLayout(LayoutKind.Sequential)]
+	public struct MSG {
+		public IntPtr hwnd;
+		public uint message;
+		public IntPtr wParam;
+		public IntPtr lParam;
+		public uint time;
+		public int ptX;
+		public int ptY;
+	}
+
+	[DllImport("user32.dll")]
+	public static extern int GetMessage(out MSG msg, IntPtr window, uint min, uint max);
+	[DllImport("user32.dll")]
+	public static extern bool TranslateMessage(ref MSG msg);
+	[DllImport("user32.dll")]
+	public static extern IntPtr DispatchMessage(ref MSG msg);
+	[DllImport("user32.dll")]
+	public static extern bool PostThreadMessage(uint thread, uint message, IntPtr wParam, IntPtr lParam);
+	[DllImport("kernel32.dll")]
+	public static extern uint GetCurrentThreadId();
+
 	[DllImport("user32.dll", SetLastError = true)]
 	public static extern IntPtr SetWindowsHookEx(int idHook, HookProc proc, IntPtr module, uint threadId);
 	[DllImport("user32.dll")]
@@ -2299,7 +2354,8 @@ public class TrayApp : ApplicationContext {
 	readonly NotifyIcon _tray;
 	readonly Osd _osd;
 	readonly Native.HookProc _proc;
-	readonly IntPtr _hook;
+	IntPtr _hook;
+	uint _hookThread;
 	readonly Dictionary<uint, string> _names = new Dictionary<uint, string>();
 	readonly SparkButton _button;
 	readonly SparkButton _mic;
@@ -2351,8 +2407,23 @@ public class TrayApp : ApplicationContext {
 		background.SetApartmentState(ApartmentState.MTA);
 		background.Start();
 		_proc = HookCallback;
-		_hook = Native.SetWindowsHookEx(13, _proc, Native.GetModuleHandle(null), 0);
-		Log.Write("started, hook " + (_hook != IntPtr.Zero ? "ok" : "FAILED " + Marshal.GetLastWin32Error()));
+		// The keyboard hook lives on its own thread with its own message loop.
+		// On the UI thread, any stall there (a busy button, a slow device)
+		// froze typing in the whole system, and Windows closed the hung
+		// AyuFancy (06.10 18:01). Here nothing else runs on that thread.
+		var hooks = new Thread(() => {
+			_hookThread = Native.GetCurrentThreadId();
+			_hook = Native.SetWindowsHookEx(13, _proc, Native.GetModuleHandle(null), 0);
+			Log.Write("started, hook " + (_hook != IntPtr.Zero ? "ok" : "FAILED " + Marshal.GetLastWin32Error()) + " on its own thread");
+			Native.MSG msg;
+			while (Native.GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) {
+				Native.TranslateMessage(ref msg);
+				Native.DispatchMessage(ref msg);
+			}
+		});
+		hooks.IsBackground = true;
+		hooks.Priority = ThreadPriority.AboveNormal;
+		hooks.Start();
 	}
 
 	static Icon MakeIcon() {
@@ -2381,6 +2452,7 @@ public class TrayApp : ApplicationContext {
 
 	protected override void ExitThreadCore() {
 		if (_hook != IntPtr.Zero) Native.UnhookWindowsHookEx(_hook);
+		if (_hookThread != 0) Native.PostThreadMessage(_hookThread, 0x12, IntPtr.Zero, IntPtr.Zero); // WM_QUIT
 		_tray.Visible = false;
 		_tray.Dispose();
 		base.ExitThreadCore();
@@ -2852,7 +2924,19 @@ public class TrayApp : ApplicationContext {
 			_mic.Recording = false;
 			if (Interlocked.CompareExchange(ref _transcribing, 1, 0) != 0) return;
 			var target = _micWindow;
-			var worker = new Thread(() => FinishDictation(target));
+			// MCI belongs to the thread that opened the device (this UI thread):
+			// stopped from a worker it answered "device is not open" (06.10 14:10).
+			string recorded;
+			try {
+				recorded = Recorder.Stop();
+			} catch (Exception e) {
+				Log.Write("mic stop: " + e.Message);
+				Show("\U0001F399 Запись не сохранилась: " + e.Message, target, 4000);
+				Recorder.Cancel();
+				Interlocked.Exchange(ref _transcribing, 0);
+				return;
+			}
+			var worker = new Thread(() => FinishDictation(target, recorded));
 			worker.SetApartmentState(ApartmentState.STA);
 			worker.IsBackground = true;
 			worker.Start();
@@ -2874,17 +2958,13 @@ public class TrayApp : ApplicationContext {
 
 	void CancelDictation() {
 		_recording = false;
-		try { _mic.BeginInvoke(new Action(() => _mic.Recording = false)); } catch { }
-		var worker = new Thread(() => Recorder.Cancel());
-		worker.IsBackground = true;
-		worker.Start();
+		// on the UI thread, where the device was opened
+		try { _mic.BeginInvoke(new Action(() => { _mic.Recording = false; Recorder.Cancel(); })); } catch { }
 		Show("\U0001F399 Отменено", _micWindow, 1500);
 	}
 
-	void FinishDictation(IntPtr window) {
-		string path = null;
+	void FinishDictation(IntPtr window, string path) {
 		try {
-			path = Recorder.Stop();
 			Show("\U0001F399 Распознаю\u2026", window, 0);
 			var watch = Stopwatch.StartNew();
 			var answer = Whisper.Transcribe(CurrentConfig(), File.ReadAllBytes(path));
@@ -3029,8 +3109,45 @@ public static class Program {
 		return result.Error.Length == 0 && result.Text != null && result.Text.Text.Length > 0 ? 0 : 1;
 	}
 
+	// Autostart runs "AyuFancy.exe --guard": it starts AyuFancy and starts it
+	// again if it dies. On 06.10 at 18:01 Windows closed a hung AyuFancy and
+	// ✨, 🎙 and the pill were gone until the next logon. «Выход» in the tray
+	// ends with code 0, then the guard stops too.
+	static int Guard() {
+		bool created;
+		using (var mutex = new Mutex(true, "Local\\AyuFancyGuard", out created)) {
+			if (!created) return 0;
+			var exe = Application.ExecutablePath;
+			var starts = new List<DateTime>();
+			while (true) {
+				starts.Add(DateTime.Now);
+				starts.RemoveAll(t => (DateTime.Now - t).TotalMinutes > 5);
+				Process child;
+				try {
+					child = Process.Start(new ProcessStartInfo(exe) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(exe) });
+				} catch (Exception e) {
+					Log.Write("guard: cannot start: " + e.Message);
+					return 1;
+				}
+				child.WaitForExit();
+				var code = child.ExitCode;
+				if (code == 0) {
+					Log.Write("guard: AyuFancy closed normally, guard stops");
+					return 0;
+				}
+				// crashing again and again: slow down instead of spinning
+				var wait = starts.Count >= 5 ? 60000 : 2000;
+				Log.Write("guard: AyuFancy died (code " + code + "), restart in " + wait / 1000 + " s");
+				Thread.Sleep(wait);
+			}
+		}
+	}
+
 	[STAThread]
 	public static int Main(string[] args) {
+		if (args.Length == 1 && args[0] == "--guard") {
+			return Guard();
+		}
 		if (args.Length == 3 && args[0] == "--selftest") {
 			return SelfTest(args[1], args[2]);
 		}
