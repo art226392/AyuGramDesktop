@@ -2466,6 +2466,7 @@ public class TrayApp : ApplicationContext {
 	IntPtr _micWindow;
 	readonly EnterToggle _toggle;
 	readonly ToolStripMenuItem _onEnter;
+	readonly ToolStripMenuItem _master;
 	bool _syncing;
 	readonly System.Windows.Forms.Timer _follow;
 	IntPtr _target;
@@ -2482,6 +2483,22 @@ public class TrayApp : ApplicationContext {
 			ContextMenuStrip = new ContextMenuStrip(),
 		};
 		_tray.ContextMenuStrip.Items.Add("\u2728 Кнопка у отправки или Ctrl+Shift+F в AyuGram").Enabled = false;
+		// Master switch (ayu-fancy-master-v1): off = no buttons, no Enter
+		// formatting, no prefetch, no dictation; keys pass straight through.
+		// Ctrl+Shift+F12 anywhere or a left click on the tray icon flips it.
+		_master = new ToolStripMenuItem("AyuFancy включён (Ctrl+Shift+F12)") { CheckOnClick = true, Checked = Config.Load().Enabled };
+		_master.CheckedChanged += (s, e) => {
+			if (_syncing) return;
+			SetEnabled(_master.Checked);
+		};
+		_tray.ContextMenuStrip.Items.Add(_master);
+		_tray.MouseClick += (s, e) => {
+			if (e.Button == MouseButtons.Left) SetEnabled(!(_cfg ?? Config.Load()).Enabled);
+		};
+		if (!_master.Checked) {
+			_tray.Icon = MakeIcon(false);
+			_tray.Text = "AyuFancy выключен: Ctrl+Shift+F12";
+		}
 		_onEnter = new ToolStripMenuItem("Оформлять при отправке (Enter)") { CheckOnClick = true, Checked = Config.Load().OnEnter };
 		_onEnter.CheckedChanged += (s, e) => {
 			if (_syncing) return;
@@ -2528,12 +2545,24 @@ public class TrayApp : ApplicationContext {
 		hooks.Start();
 	}
 
-	static Icon MakeIcon() {
+	void SetEnabled(bool on) {
+		if (!on && _recording) CancelDictation();
+		SaveSetting("enabled", on);
+		_syncing = true;
+		_master.Checked = on;
+		_syncing = false;
+		_tray.Icon = MakeIcon(on);
+		_tray.Text = on ? "AyuFancy: Ctrl+Shift+F в AyuGram" : "AyuFancy выключен: Ctrl+Shift+F12";
+		Show(on ? "\u2728 AyuFancy включён" : "AyuFancy выключен (Ctrl+Shift+F12 вернуть)", IntPtr.Zero, 1800);
+		Log.Write("master " + (on ? "on" : "off"));
+	}
+
+	static Icon MakeIcon(bool on = true) {
 		using (var bitmap = new Bitmap(32, 32)) {
 			using (var g = Graphics.FromImage(bitmap)) {
 				g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
 				g.Clear(Color.Transparent);
-				using (var brush = new SolidBrush(Color.FromArgb(150, 90, 255))) {
+				using (var brush = new SolidBrush(on ? Color.FromArgb(150, 90, 255) : Color.FromArgb(110, 110, 120))) {
 					g.FillEllipse(brush, 1, 1, 30, 30);
 				}
 				using (var font = new Font("Segoe UI", 15f, FontStyle.Bold, GraphicsUnit.Pixel)) {
@@ -2584,6 +2613,16 @@ public class TrayApp : ApplicationContext {
 			var flags = Marshal.ReadInt32(lParam, 8);
 			var injected = (flags & 0x10) != 0;
 			var config = _cfg;
+			if (!injected && key == 0x7B // F12
+				&& Native.Down(Native.VK_CONTROL)
+				&& Native.Down(Native.VK_SHIFT)
+				&& !Native.Down(Native.VK_MENU)) {
+				try {
+					_osd.BeginInvoke(new Action(() => SetEnabled(!(_cfg ?? Config.Load()).Enabled)));
+				} catch {
+				}
+				return (IntPtr)1;
+			}
 			if (injected || config == null || !config.Enabled) {
 				return Native.CallNextHookEx(_hook, code, wParam, lParam);
 			}
@@ -2770,6 +2809,12 @@ public class TrayApp : ApplicationContext {
 		}
 		var window = foreground != IntPtr.Zero ? Native.GetAncestor(foreground, 2) : IntPtr.Zero; // GA_ROOT
 		int appPid;
+		if (_master.Checked != config.Enabled) { // ayu_fancy.json edited by hand
+			_syncing = true;
+			_master.Checked = config.Enabled;
+			_syncing = false;
+			_tray.Icon = MakeIcon(config.Enabled);
+		}
 		var show = config.Enabled
 			&& (config.Button || config.Toggle || config.Dictation)
 			&& window != IntPtr.Zero
