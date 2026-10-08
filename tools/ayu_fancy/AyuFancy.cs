@@ -2266,6 +2266,15 @@ public static class Native {
 	public static extern bool GetWindowRect(IntPtr window, out RECT rect);
 	[DllImport("user32.dll")]
 	public static extern bool GetClientRect(IntPtr window, out RECT rect);
+	public delegate bool EnumProc(IntPtr window, IntPtr param);
+	[DllImport("user32.dll")]
+	public static extern bool EnumWindows(EnumProc proc, IntPtr param);
+	[DllImport("user32.dll", CharSet = CharSet.Unicode)]
+	public static extern int GetClassName(IntPtr window, StringBuilder name, int size);
+	[DllImport("user32.dll")]
+	public static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int cx, int cy, uint flags);
+	[DllImport("user32.dll")]
+	public static extern bool IsWindow(IntPtr window);
 	[DllImport("user32.dll")]
 	public static extern bool ClientToScreen(IntPtr window, ref Point point);
 	[DllImport("user32.dll")]
@@ -2376,7 +2385,7 @@ public class SparkButton : Form {
 	public void Place(Rectangle client, float scale, int right, int bottom) {
 		if (_dragging) return;
 		_scale = scale;
-		var size = (int)Math.Round(34 * scale);
+		var size = (int)Math.Round(EnterToggle.ButtonSize * scale);
 		var location = new Point(
 			client.Right - (int)Math.Round(right * scale) - size,
 			client.Bottom - (int)Math.Round(bottom * scale) - size);
@@ -2392,7 +2401,7 @@ public class SparkButton : Form {
 		using (var brush = new SolidBrush(color)) {
 			g.FillEllipse(brush, 1, 1, Width - 3, Height - 3);
 		}
-		using (var font = new Font("Segoe UI Emoji", Height * 0.42f, GraphicsUnit.Pixel)) {
+		using (var font = new Font("Segoe UI Emoji", Height * 0.5f, GraphicsUnit.Pixel)) {
 			var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
 			g.DrawString(_busy && !_recording ? "\u2026" : _recording ? "\u25A0" : Glyph, font, Brushes.White, new RectangleF(0, 1, Width - 1, Height - 1), format);
 		}
@@ -2455,10 +2464,11 @@ public class SparkButton : Form {
 // Never takes the focus, so the message field stays active.
 public class EnterToggle : Form {
 	public Action Clicked;
-	public const int BaseWidth = 152;
-	public const int BaseHeight = 26;
-	public const int GroupGap = 4; // px between pill, 🎙 and ✨ at 100% scale
-	public const int GroupStep = 34 + GroupGap; // ✨ to 🎙
+	public const int BaseWidth = 104;
+	public const int BaseHeight = 22;
+	public const int ButtonSize = 22; // 🎙 and ✨, same height as the pill
+	public const int GroupGap = 2; // px between pill, 🎙, ✨ and VoiceType at 100% scale
+	public const int GroupStep = ButtonSize + GroupGap; // ✨ to 🎙
 	bool _on = true;
 	bool _hover;
 
@@ -2511,7 +2521,7 @@ public class EnterToggle : Form {
 		_scale = scale;
 		Client = client;
 		var size = new Size((int)Math.Round(BaseWidth * scale), (int)Math.Round(BaseHeight * scale));
-		var button = (int)Math.Round(34 * scale);
+		var button = (int)Math.Round(ButtonSize * scale);
 		var location = new Point(
 			client.Right - (int)Math.Round((right + GroupStep + GroupGap) * scale) - button - size.Width,
 			client.Bottom - (int)Math.Round(bottom * scale) - button + (button - size.Height) / 2);
@@ -2544,12 +2554,13 @@ public class EnterToggle : Form {
 		g.Clear(fill);
 		var h = Height;
 		// switch knob: right and white when on, left and grey when off
-		var knob = h - 10;
-		var knobX = _on ? Width - knob - 6 : 6;
+		var pad = Math.Max(3, h / 6);
+		var knob = h - pad * 2;
+		var knobX = _on ? Width - knob - pad - 1 : pad + 1;
 		using (var brush = new SolidBrush(_on ? Color.White : Color.FromArgb(150, 150, 160))) {
-			g.FillEllipse(brush, knobX, 5, knob, knob);
+			g.FillEllipse(brush, knobX, pad, knob, knob);
 		}
-		using (var font = new Font("Segoe UI Semibold", h * 0.44f, GraphicsUnit.Pixel))
+		using (var font = new Font("Segoe UI Semibold", h * 0.45f, GraphicsUnit.Pixel))
 		using (var brush = new SolidBrush(_on ? Color.White : Color.FromArgb(200, 200, 210))) {
 			var format = new StringFormat(StringFormatFlags.NoWrap) { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
 			var text = _on ? "AyuFancy ВКЛ" : "AyuFancy ВЫКЛ";
@@ -2750,24 +2761,24 @@ public class TrayApp : ApplicationContext {
 		_button = new SparkButton();
 		_mic = new SparkButton { Glyph = "\U0001F399" };
 		_mic.Clicked = () => ToggleDictation(_target);
-		_mic.Moving = (dx, dy) => { MoveBy(_button, dx, dy); MoveBy(_toggle, dx, dy); };
-		_button.Moving = (dx, dy) => { MoveBy(_mic, dx, dy); MoveBy(_toggle, dx, dy); };
+		_mic.Moving = (dx, dy) => { MoveBy(_button, dx, dy); MoveBy(_toggle, dx, dy); MoveVoiceType(dx, dy); };
+		_button.Moving = (dx, dy) => { MoveBy(_mic, dx, dy); MoveBy(_toggle, dx, dy); MoveVoiceType(dx, dy); };
 		_mic.Moved = (right, bottom) => SaveButtonPlace(right - EnterToggle.GroupStep, bottom);
 		_button.Clicked = () => StartRun(_target, Trigger.Button);
 		_button.Moved = SaveButtonPlace;
 		// The pill is the one master switch (ayu-fancy-pill-master-v1).
 		_toggle = new EnterToggle { On = _master.Checked };
 		_toggle.Clicked = TogglePill;
-		_toggle.Moving = (dx, dy) => { MoveBy(_mic, dx, dy); MoveBy(_button, dx, dy); };
+		_toggle.Moving = (dx, dy) => { MoveBy(_mic, dx, dy); MoveBy(_button, dx, dy); MoveVoiceType(dx, dy); };
 		// the whole block is saved as the place of ✨, worked out from the pill
 		_toggle.Moved = (x, y) => {
 			var c = _toggle.Client;
 			var scale = _toggle.Width / (float)EnterToggle.BaseWidth;
-			var right = (int)Math.Round((c.Right - _toggle.Right) / scale) - EnterToggle.GroupGap - 34 - EnterToggle.GroupGap - 34;
-			var bottom = (int)Math.Round((c.Bottom - _toggle.Bottom) / scale) - (34 - EnterToggle.BaseHeight) / 2;
+			var right = (int)Math.Round((c.Right - _toggle.Right) / scale) - EnterToggle.GroupGap - EnterToggle.GroupStep - EnterToggle.ButtonSize;
+			var bottom = (int)Math.Round((c.Bottom - _toggle.Bottom) / scale) - (EnterToggle.ButtonSize - EnterToggle.BaseHeight) / 2;
 			SaveButtonPlace(right, bottom);
 		};
-		_follow = new System.Windows.Forms.Timer { Interval = 150 };
+		_follow = new System.Windows.Forms.Timer { Interval = 50 };
 		_follow.Tick += (s, e) => Follow();
 		_follow.Start();
 		_cfg = Config.Load();
@@ -3117,10 +3128,49 @@ public class TrayApp : ApplicationContext {
 		} catch {
 		}
 		_target = window;
-		// the block [pill][🎙][✨] stays inside the window whole
-		var groupWidth = EnterToggle.BaseWidth + EnterToggle.GroupGap + EnterToggle.GroupStep + 34;
-		var right = Math.Max(0, Math.Min(config.ButtonRight, (int)(rect.Right / scale) - groupWidth));
-		var bottom = Math.Max(0, Math.Min(config.ButtonBottom, (int)(rect.Bottom / scale) - 34));
+		var right = config.ButtonRight;
+		var bottom = config.ButtonBottom;
+		// VoiceType pill sits right of ✨; dragging it drags the whole block
+		var vt = FindVoiceType();
+		Native.RECT vtRect = new Native.RECT();
+		var vtWidth = 0;
+		if (vt != IntPtr.Zero && Native.GetWindowRect(vt, out vtRect)) {
+			vtWidth = vtRect.Right - vtRect.Left;
+			var at = new Point(vtRect.Left, vtRect.Top);
+			if (_vtSet.HasValue && _vtSet.Value != at) {
+				var button = (int)Math.Round(EnterToggle.ButtonSize * scale);
+				var vtHeight = vtRect.Bottom - vtRect.Top;
+				var r = (int)Math.Round((client.Right - vtRect.Left) / scale) + EnterToggle.GroupGap;
+				var b = (int)Math.Round((client.Bottom - (vtRect.Top + (vtHeight - button) / 2) - button) / scale);
+				_vtGroup = new Point(r, b);
+				_vtSet = at;
+			}
+			if (_vtGroup.HasValue) {
+				right = _vtGroup.Value.X;
+				bottom = _vtGroup.Value.Y;
+				if ((Native.GetAsyncKeyState(0x01) & 0x8000) == 0) { // left button up: drag done
+					_vtGroup = null;
+					SaveButtonPlace(right, bottom);
+				}
+			}
+		} else {
+			vt = IntPtr.Zero;
+		}
+		// the block [pill][🎙][✨][VoiceType] stays inside the window whole
+		var vtUnits = vt != IntPtr.Zero ? EnterToggle.GroupGap + (int)Math.Ceiling(vtWidth / scale) : 0;
+		var groupWidth = EnterToggle.BaseWidth + EnterToggle.GroupGap + EnterToggle.GroupStep + EnterToggle.ButtonSize + vtUnits;
+		right = Math.Max(vtUnits, Math.Min(right, (int)(rect.Right / scale) - groupWidth + vtUnits));
+		bottom = Math.Max(0, Math.Min(bottom, (int)(rect.Bottom / scale) - EnterToggle.ButtonSize));
+		if (vt != IntPtr.Zero && !_vtGroup.HasValue) {
+			var button = (int)Math.Round(EnterToggle.ButtonSize * scale);
+			var want = new Point(
+				client.Right - (int)Math.Round(right * scale) + (int)Math.Round(EnterToggle.GroupGap * scale),
+				client.Bottom - (int)Math.Round(bottom * scale) - button + (button - (vtRect.Bottom - vtRect.Top)) / 2);
+			if (want != new Point(vtRect.Left, vtRect.Top)) {
+				Native.SetWindowPos(vt, IntPtr.Zero, want.X, want.Y, 0, 0, 0x0001 | 0x0004 | 0x0010); // NOSIZE, NOZORDER, NOACTIVATE
+			}
+			_vtSet = want;
+		}
 		// always left of 🎙's place, so the pill never jumps
 		_toggle.Place(client, scale, right, bottom);
 		if (!_toggle.Visible) _toggle.Show();
@@ -3164,6 +3214,55 @@ public class TrayApp : ApplicationContext {
 		} catch (Exception e) {
 			Log.Write("setting not saved: " + e.Message);
 		}
+	}
+
+	// VoiceType (D:\VoiceType) pill: a Tk window of a pythonw running voicetype.py.
+	IntPtr _vt;
+	DateTime _vtLookup;
+	Point? _vtSet; // where AyuFancy put it last; anything else = the user dragged it
+	Point? _vtGroup; // right, bottom of ✨ while VoiceType is dragged, saved on release
+
+	IntPtr FindVoiceType() {
+		if (_vt != IntPtr.Zero && Native.IsWindow(_vt) && Native.IsWindowVisible(_vt)) return _vt;
+		if (DateTime.Now - _vtLookup < TimeSpan.FromSeconds(5)) return IntPtr.Zero;
+		_vtLookup = DateTime.Now;
+		_vt = IntPtr.Zero;
+		_vtSet = null;
+		var pids = new HashSet<uint>();
+		try {
+			using (var search = new System.Management.ManagementObjectSearcher("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name LIKE 'python%'")) {
+				foreach (System.Management.ManagementObject process in search.Get()) {
+					var line = process["CommandLine"] as string;
+					if (line != null && line.IndexOf("voicetype.py", StringComparison.OrdinalIgnoreCase) >= 0) pids.Add((uint)process["ProcessId"]);
+				}
+			}
+		} catch {
+		}
+		if (pids.Count == 0) return IntPtr.Zero;
+		var found = IntPtr.Zero;
+		Native.EnumWindows((w, l) => {
+			uint pid;
+			Native.GetWindowThreadProcessId(w, out pid);
+			if (!pids.Contains(pid) || !Native.IsWindowVisible(w)) return true;
+			var name = new StringBuilder(32);
+			Native.GetClassName(w, name, 32);
+			Native.RECT r;
+			if (name.ToString() == "TkTopLevel" && Native.GetWindowRect(w, out r) && r.Bottom - r.Top < 80) {
+				found = w;
+				return false;
+			}
+			return true;
+		}, IntPtr.Zero);
+		_vt = found;
+		return found;
+	}
+
+	void MoveVoiceType(int dx, int dy) {
+		Native.RECT r;
+		if (_vt == IntPtr.Zero || !Native.GetWindowRect(_vt, out r)) return;
+		var at = new Point(r.Left + dx, r.Top + dy);
+		Native.SetWindowPos(_vt, IntPtr.Zero, at.X, at.Y, 0, 0, 0x0001 | 0x0004 | 0x0010);
+		_vtSet = at;
 	}
 
 	static void MoveBy(Form form, int dx, int dy) {
