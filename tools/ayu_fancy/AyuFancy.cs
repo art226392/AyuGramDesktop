@@ -930,6 +930,10 @@ public class Config {
 	// in pixels at 100% scale: just above the send button by default.
 	public int ButtonRight = 14;
 	public int ButtonBottom = 62;
+	// Pill position from the top left of the AyuGram window, 100% scale;
+	// -1 = top centre (ayu-fancy-drag-v1: drag it anywhere with the mouse).
+	public int PillX = -1;
+	public int PillY = -1;
 	public List<string> Apps = new List<string> { "ayugram", "telegram", "64gram", "kotatogram", "materialgram", "exteragram" };
 
 	public static string Folder() {
@@ -993,6 +997,8 @@ public class Config {
 					object number;
 					if (json.TryGetValue("button_right", out number) && number is int) result.ButtonRight = (int)number;
 					if (json.TryGetValue("button_bottom", out number) && number is int) result.ButtonBottom = (int)number;
+					if (json.TryGetValue("pill_x", out number) && number is int) result.PillX = (int)number;
+					if (json.TryGetValue("pill_y", out number) && number is int) result.PillY = (int)number;
 					object apps;
 					if (json.TryGetValue("apps", out apps) && apps is object[]) {
 						result.Apps = ((object[])apps).OfType<string>().Select(a => a.ToLowerInvariant()).ToList();
@@ -2324,7 +2330,7 @@ public class SparkButton : Form {
 		Cursor = Cursors.Hand;
 		Size = new Size(38, 38);
 		var tip = new ToolTip();
-		tip.SetToolTip(this, "\u2728 Оформить красиво (Codex)  Ctrl+Shift+F\nПравой кнопкой можно перетащить");
+		tip.SetToolTip(this, "\u2728 Оформить красиво (Codex)  Ctrl+Shift+F\nЗажми и тащи, чтобы переставить");
 	}
 
 	protected override bool ShowWithoutActivation {
@@ -2394,9 +2400,14 @@ public class SparkButton : Form {
 	protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
 	protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
 
+	bool _pressed;
+	Point _pressAt;
+
 	protected override void OnMouseDown(MouseEventArgs e) {
-		if (e.Button == MouseButtons.Right) {
-			_dragging = true;
+		if (e.Button == MouseButtons.Right || e.Button == MouseButtons.Left) {
+			_pressed = true;
+			_pressAt = Cursor.Position;
+			_dragging = e.Button == MouseButtons.Right;
 			_dragFrom = e.Location;
 			Capture = true;
 		}
@@ -2404,6 +2415,10 @@ public class SparkButton : Form {
 	}
 
 	protected override void OnMouseMove(MouseEventArgs e) {
+		if (_pressed && !_dragging) {
+			var now = Cursor.Position;
+			if (Math.Abs(now.X - _pressAt.X) > 4 || Math.Abs(now.Y - _pressAt.Y) > 4) _dragging = true;
+		}
 		if (_dragging) {
 			Location = new Point(Location.X + e.X - _dragFrom.X, Location.Y + e.Y - _dragFrom.Y);
 		}
@@ -2413,7 +2428,8 @@ public class SparkButton : Form {
 	public Rectangle Client;
 
 	protected override void OnMouseUp(MouseEventArgs e) {
-		if (_dragging && e.Button == MouseButtons.Right) {
+		_pressed = false;
+		if (_dragging) {
 			_dragging = false;
 			Capture = false;
 			if (Moved != null && _scale > 0) {
@@ -2448,7 +2464,7 @@ public class EnterToggle : Form {
 		Cursor = Cursors.Hand;
 		Size = new Size(BaseWidth, BaseHeight);
 		var tip = new ToolTip();
-		tip.SetToolTip(this, "Клик: всё AyuFancy включить или выключить\n(оформление по Enter, ✨ и 🎙)");
+		tip.SetToolTip(this, "Клик: всё AyuFancy включить или выключить\n(оформление по Enter, ✨ и 🎙)\nЗажми и тащи, чтобы переставить");
 	}
 
 	protected override bool ShowWithoutActivation {
@@ -2480,11 +2496,20 @@ public class EnterToggle : Form {
 
 	// Top centre of the AyuGram window, in the empty title strip, so it never
 	// covers messages (ayu-fancy-pill-top-v1, Arthur 08.10: «its in my face»).
-	public void Place(Rectangle client, float scale, int right, int bottom) {
+	// Dragged with the mouse: x, y from the client top left at 100% scale.
+	public void Place(Rectangle client, float scale, int x, int y) {
+		if (_dragging) return;
+		_scale = scale;
+		Client = client;
 		var size = new Size((int)Math.Round(BaseWidth * scale), (int)Math.Round(BaseHeight * scale));
 		var location = new Point(
 			client.Left + (client.Width - size.Width) / 2,
 			client.Top + (int)Math.Round(3 * scale));
+		if (x >= 0 && y >= 0) {
+			location = new Point(
+				Math.Max(client.Left, Math.Min(client.Right - size.Width, client.Left + (int)Math.Round(x * scale))),
+				Math.Max(client.Top, Math.Min(client.Bottom - size.Height, client.Top + (int)Math.Round(y * scale))));
+		}
 		if (Size != size) {
 			Size = size;
 			// Rounded shape as the window region: no colour key, so no pink fringe.
@@ -2531,8 +2556,52 @@ public class EnterToggle : Form {
 	protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
 	protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
 
+	public Action<int, int> Moved; // new x, y from the client top left, 100% scale
+	public Rectangle Client;
+	float _scale = 1f;
+	bool _pressed;
+	bool _dragging;
+	Point _pressAt;
+	Point _dragFrom;
+
+	public bool Dragging {
+		get { return _dragging; }
+	}
+
+	protected override void OnMouseDown(MouseEventArgs e) {
+		if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right) {
+			_pressed = true;
+			_pressAt = Cursor.Position;
+			_dragFrom = e.Location;
+			_dragging = e.Button == MouseButtons.Right;
+			Capture = true;
+		}
+		base.OnMouseDown(e);
+	}
+
+	protected override void OnMouseMove(MouseEventArgs e) {
+		if (_pressed && !_dragging) {
+			var now = Cursor.Position;
+			if (Math.Abs(now.X - _pressAt.X) > 4 || Math.Abs(now.Y - _pressAt.Y) > 4) _dragging = true;
+		}
+		if (_dragging) {
+			Location = new Point(Location.X + e.X - _dragFrom.X, Location.Y + e.Y - _dragFrom.Y);
+		}
+		base.OnMouseMove(e);
+	}
+
 	protected override void OnMouseUp(MouseEventArgs e) {
-		if (e.Button == MouseButtons.Left && Clicked != null) Clicked();
+		var wasPressed = _pressed;
+		_pressed = false;
+		Capture = false;
+		if (_dragging) {
+			_dragging = false;
+			if (Moved != null && _scale > 0) {
+				Moved((int)Math.Round((Left - Client.Left) / _scale), (int)Math.Round((Top - Client.Top) / _scale));
+			}
+		} else if (wasPressed && e.Button == MouseButtons.Left && Clicked != null) {
+			Clicked();
+		}
 		base.OnMouseUp(e);
 	}
 }
@@ -2662,6 +2731,11 @@ public class TrayApp : ApplicationContext {
 		};
 		_tray.ContextMenuStrip.Items.Add(_onEnter);
 		_tray.ContextMenuStrip.Items.Add("Настройки", null, (s, e) => OpenFile("ayu_fancy.json"));
+		_tray.ContextMenuStrip.Items.Add("Кнопки и пилюлю на место", null, (s, e) => {
+			SaveSetting("pill_x", -1);
+			SaveSetting("pill_y", -1);
+			SaveButtonPlace(14, 145);
+		});
 		_tray.ContextMenuStrip.Items.Add("Лог", null, (s, e) => OpenFile("ayu_fancy.log"));
 		_tray.ContextMenuStrip.Items.Add("Выход", null, (s, e) => ExitThread());
 		_button = new SparkButton();
@@ -2673,6 +2747,11 @@ public class TrayApp : ApplicationContext {
 		// The pill is the one master switch (ayu-fancy-pill-master-v1).
 		_toggle = new EnterToggle { On = _master.Checked };
 		_toggle.Clicked = TogglePill;
+		_toggle.Moved = (x, y) => {
+			SaveSetting("pill_x", Math.Max(0, x));
+			SaveSetting("pill_y", Math.Max(0, y));
+			Log.Write("pill moved to " + x + "," + y);
+		};
 		_follow = new System.Windows.Forms.Timer { Interval = 150 };
 		_follow.Tick += (s, e) => Follow();
 		_follow.Start();
@@ -2983,7 +3062,7 @@ public class TrayApp : ApplicationContext {
 		var config = _cfg;
 		if (config == null) return;
 		var foreground = Native.GetForegroundWindow();
-		if (foreground == _button.Handle || foreground == _mic.Handle || foreground == _toggle.Handle || _button.Dragging || _mic.Dragging) {
+		if (foreground == _button.Handle || foreground == _mic.Handle || foreground == _toggle.Handle || _button.Dragging || _mic.Dragging || _toggle.Dragging) {
 			return;
 		}
 		var window = foreground != IntPtr.Zero ? Native.GetAncestor(foreground, 2) : IntPtr.Zero; // GA_ROOT
@@ -3024,7 +3103,7 @@ public class TrayApp : ApplicationContext {
 		}
 		_target = window;
 		// always left of 🎙's place, so the pill never jumps
-		_toggle.Place(client, scale, config.ButtonRight + 40, config.ButtonBottom);
+		_toggle.Place(client, scale, config.PillX, config.PillY);
 		if (!_toggle.Visible) _toggle.Show();
 		if (!config.Enabled) {
 			if (_button.Visible && _busy == 0) _button.Hide();
