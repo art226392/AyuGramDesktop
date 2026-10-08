@@ -2478,12 +2478,13 @@ public class EnterToggle : Form {
 		set { if (_on != value) { _on = value; Invalidate(); } }
 	}
 
-	// Left of the ✨ button (34 px at 100%, 8 px gap), centred on it.
+	// Top centre of the AyuGram window, in the empty title strip, so it never
+	// covers messages (ayu-fancy-pill-top-v1, Arthur 08.10: «its in my face»).
 	public void Place(Rectangle client, float scale, int right, int bottom) {
 		var size = new Size((int)Math.Round(BaseWidth * scale), (int)Math.Round(BaseHeight * scale));
 		var location = new Point(
-			client.Right - (int)Math.Round((right + 34 + 8) * scale) - size.Width,
-			client.Bottom - (int)Math.Round((bottom + (34 - BaseHeight) / 2) * scale) - size.Height);
+			client.Left + (client.Width - size.Width) / 2,
+			client.Top + (int)Math.Round(3 * scale));
 		if (Size != size) {
 			Size = size;
 			// Rounded shape as the window region: no colour key, so no pink fringe.
@@ -3271,6 +3272,7 @@ public class TrayApp : ApplicationContext {
 			return;
 		}
 		_live = live;
+		Log.Write("dictation: start");
 		Engines.WarmGroq(CurrentConfig()); // the first phrase took 6.5 s on a cold connection
 		_micWindow = window;
 		_dictationCancel = false;
@@ -3307,7 +3309,7 @@ public class TrayApp : ApplicationContext {
 		// quiet = clearly below the loud part of this phrase
 		var peak = 0.0;
 		for (var f = segment; f < frames; ++f) peak = Math.Max(peak, FrameRms(pcm, f));
-		var quiet = Math.Max(200, peak * 0.12);
+		var quiet = Math.Max(90, peak * 0.12); // 12:07: a quiet mic peaked at ~380
 		var silent = 0;
 		for (var f = frames - 1; f >= segment && FrameRms(pcm, f) < quiet; --f) ++silent;
 		// a pause after speech; 0.75 s: shorter phrases came out garbled (08.10)
@@ -3410,9 +3412,9 @@ public class TrayApp : ApplicationContext {
 			var loud = 0;
 			var floor = 0.0;
 			for (var f = from; f < till; ++f) floor += FrameRms(pcm, f);
-			floor = Math.Max(250, floor / Math.Max(1, till - from) * 0.6);
+			floor = Math.Max(110, floor / Math.Max(1, till - from) * 0.6);
 			for (var f = from; f < till; ++f) if (FrameRms(pcm, f) > floor) ++loud;
-			if (loud < 6) return true;
+			if (loud < 4) { Log.Write("dictation: phrase " + (till - from) / 20.0 + " s skipped as noise, loud " + loud + ", floor " + (int)floor); return true; }
 			foreach (var model in models) {
 				DateTime until;
 				if (restUntil.TryGetValue(model, out until) && DateTime.Now < until) continue;
@@ -3422,6 +3424,7 @@ public class TrayApp : ApplicationContext {
 				if (answer.Error.Length > 0) { Show("\U0001F399 " + answer.Error, window, 4000); return false; }
 				var text = answer.Text.Trim();
 				if (text.Length > 0 && !Hallucination.IsMatch(text) && config.DictationLanguage.Length > 0) text = ToLanguage(config, text, dictated.ToString());
+				Log.Write("dictation: phrase " + (till - from) / 20.0 + " s, loud " + loud + ", " + model + ": " + text.Length + " chars" + (Hallucination.IsMatch(text) ? " (junk)" : ""));
 				if (text.Length == 0 || Hallucination.IsMatch(text)) return true;
 				if (pending.Length > 0 || dictated.Length > 0) pending.Append(' ');
 				pending.Append(text);
@@ -3474,6 +3477,7 @@ public class TrayApp : ApplicationContext {
 			}
 			flush();
 			if (phrases == 0) {
+				Log.Write("dictation: no phrases, " + live.Snapshot().Length / 32000.0 + " s recorded");
 				if (!_dictationCancel) Show("\U0001F399 Ничего не расслышал", window, 2500);
 				return;
 			}
