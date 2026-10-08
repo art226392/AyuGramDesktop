@@ -933,6 +933,8 @@ public class Config {
 	// Pill position from the top left of the AyuGram window, 100% scale;
 	// -1 = top centre (ayu-fancy-drag-v1: drag it anywhere with the mouse).
 	public int PillX = -1;
+	// ayu-fancy-compact-v1: only ✨ is seen, the mouse over it opens all four
+	public bool Compact = true;
 	public int PillY = -1;
 	public List<string> Apps = new List<string> { "ayugram", "telegram", "64gram", "kotatogram", "materialgram", "exteragram" };
 
@@ -966,6 +968,7 @@ public class Config {
 				var json = new JavaScriptSerializer().DeserializeObject(File.ReadAllText(path, Encoding.UTF8).TrimStart('\uFEFF')) as Dictionary<string, object>;
 				if (json != null) {
 					result.Enabled = Bool(json, "enabled", true);
+					result.Compact = Bool(json, "compact", true);
 					result.Engine = Str(json, "engine", result.Engine).ToLowerInvariant();
 					result.CodexPath = Str(json, "codex_path", result.CodexPath);
 					result.CodexModel = Str(json, "codex_model", result.CodexModel);
@@ -2276,6 +2279,8 @@ public static class Native {
 	[DllImport("user32.dll")]
 	public static extern bool IsWindow(IntPtr window);
 	[DllImport("user32.dll")]
+	public static extern bool ShowWindow(IntPtr window, int command);
+	[DllImport("user32.dll")]
 	public static extern bool ClientToScreen(IntPtr window, ref Point point);
 	[DllImport("user32.dll")]
 	public static extern bool IsIconic(IntPtr window);
@@ -2733,6 +2738,8 @@ public class TrayApp : ApplicationContext {
 		// Master switch (ayu-fancy-master-v1): off = no buttons, no Enter
 		// formatting, no prefetch, no dictation; keys pass straight through.
 		// Ctrl+Shift+F12 anywhere or a left click on the tray icon flips it.
+		SaveSetting("enabled", true);
+		SaveSetting("on_enter", true);
 		_master = new ToolStripMenuItem("AyuFancy включён (Ctrl+Shift+F12)") { CheckOnClick = true, Checked = Config.Load().Enabled };
 		_master.CheckedChanged += (s, e) => {
 			if (_syncing) return;
@@ -2844,6 +2851,7 @@ public class TrayApp : ApplicationContext {
 	}
 
 	protected override void ExitThreadCore() {
+		ShowVoiceType(true);
 		if (_hook != IntPtr.Zero) Native.UnhookWindowsHookEx(_hook);
 		if (_hookThread != 0) Native.PostThreadMessage(_hookThread, 0x12, IntPtr.Zero, IntPtr.Zero); // WM_QUIT
 		_tray.Visible = false;
@@ -3106,6 +3114,7 @@ public class TrayApp : ApplicationContext {
 			&& Native.IsWindowVisible(window)
 			&& !Native.IsIconic(window);
 		if (!show) {
+			ShowVoiceType(true);
 			if (_button.Visible && _busy == 0) _button.Hide();
 			if (_mic.Visible) _mic.Hide(); // красная кнопка записи не торчит поверх чужих окон
 			if (_toggle.Visible) _toggle.Hide();
@@ -3113,6 +3122,7 @@ public class TrayApp : ApplicationContext {
 		}
 		Native.RECT rect;
 		if (!Native.GetClientRect(window, out rect) || rect.Right < 300 || rect.Bottom < 200) {
+			ShowVoiceType(true);
 			if (_button.Visible) _button.Hide();
 			if (_mic.Visible) _mic.Hide(); // красная кнопка записи не торчит поверх чужих окон
 			if (_toggle.Visible) _toggle.Hide();
@@ -3171,9 +3181,31 @@ public class TrayApp : ApplicationContext {
 			}
 			_vtSet = want;
 		}
+		// Folded: only ✨ (or the pill when AyuFancy is off). The mouse over it
+		// opens all four, they fold again 0.7 s after the mouse leaves.
+		var px = (int)Math.Round(EnterToggle.ButtonSize * scale);
+		var sparkRight = client.Right - (int)Math.Round(right * scale);
+		var sparkBottom = client.Bottom - (int)Math.Round(bottom * scale);
+		var anchorIsSpark = config.Enabled && config.Button;
+		var full = Rectangle.FromLTRB(
+			sparkRight - (int)Math.Round((EnterToggle.BaseWidth + EnterToggle.GroupGap + EnterToggle.GroupStep + EnterToggle.ButtonSize) * scale),
+			sparkBottom - px,
+			sparkRight + (int)Math.Round(vtUnits * scale),
+			sparkBottom);
+		var small = anchorIsSpark
+			? new Rectangle(sparkRight - px, sparkBottom - px, px, px)
+			: Rectangle.FromLTRB(full.Left, full.Top, full.Left + (int)Math.Round(EnterToggle.BaseWidth * scale), full.Bottom);
+		var now = DateTime.Now;
+		var area = _open ? full : small;
+		area.Inflate((int)Math.Round(6 * scale), (int)Math.Round(6 * scale));
+		if (area.Contains(Cursor.Position) || _vtGroup.HasValue) _hoverAt = now;
+		_open = !config.Compact || now - _hoverAt < TimeSpan.FromMilliseconds(700);
+		var pill = _open || !anchorIsSpark;
 		// always left of 🎙's place, so the pill never jumps
 		_toggle.Place(client, scale, right, bottom);
-		if (!_toggle.Visible) _toggle.Show();
+		if (pill && !_toggle.Visible) _toggle.Show();
+		if (!pill && _toggle.Visible) _toggle.Hide();
+		ShowVoiceType(_open);
 		if (!config.Enabled) {
 			if (_button.Visible && _busy == 0) _button.Hide();
 			if (_mic.Visible && !_recording) _mic.Hide();
@@ -3186,7 +3218,7 @@ public class TrayApp : ApplicationContext {
 		} else if (_button.Visible && _busy == 0) {
 			_button.Hide();
 		}
-		if (config.Dictation) {
+		if (config.Dictation && (_open || _recording)) {
 			_mic.Client = client;
 			_mic.Place(client, scale, right + EnterToggle.GroupStep, bottom);
 			if (!_mic.Visible) _mic.Show();
@@ -3223,7 +3255,7 @@ public class TrayApp : ApplicationContext {
 	Point? _vtGroup; // right, bottom of ✨ while VoiceType is dragged, saved on release
 
 	IntPtr FindVoiceType() {
-		if (_vt != IntPtr.Zero && Native.IsWindow(_vt) && Native.IsWindowVisible(_vt)) return _vt;
+		if (_vt != IntPtr.Zero && Native.IsWindow(_vt)) return _vt;
 		if (DateTime.Now - _vtLookup < TimeSpan.FromSeconds(5)) return IntPtr.Zero;
 		_vtLookup = DateTime.Now;
 		_vt = IntPtr.Zero;
@@ -3243,18 +3275,31 @@ public class TrayApp : ApplicationContext {
 		Native.EnumWindows((w, l) => {
 			uint pid;
 			Native.GetWindowThreadProcessId(w, out pid);
-			if (!pids.Contains(pid) || !Native.IsWindowVisible(w)) return true;
+			if (!pids.Contains(pid)) return true;
 			var name = new StringBuilder(32);
 			Native.GetClassName(w, name, 32);
 			Native.RECT r;
-			if (name.ToString() == "TkTopLevel" && Native.GetWindowRect(w, out r) && r.Bottom - r.Top < 80) {
+			if (name.ToString() == "TkTopLevel" && Native.GetWindowRect(w, out r) && r.Bottom - r.Top < 80 && r.Bottom - r.Top > 10 && r.Right - r.Left > 60) {
 				found = w;
 				return false;
 			}
 			return true;
 		}, IntPtr.Zero);
 		_vt = found;
+		_vtHidden = found != IntPtr.Zero && !Native.IsWindowVisible(found); // a crash left it hidden
 		return found;
+	}
+
+	bool _vtHidden;
+	bool _open;
+	DateTime _hoverAt;
+
+	// Hidden while the block is folded; shown again outside AyuGram and on exit.
+	void ShowVoiceType(bool show) {
+		if (_vt == IntPtr.Zero || !Native.IsWindow(_vt)) return;
+		if (show == !_vtHidden) return;
+		Native.ShowWindow(_vt, show ? 4 : 0); // SW_SHOWNOACTIVATE / SW_HIDE
+		_vtHidden = !show;
 	}
 
 	void MoveVoiceType(int dx, int dy) {
