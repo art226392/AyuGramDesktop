@@ -919,6 +919,10 @@ public class Config {
 	public string WhisperModel = "whisper-large-v3";
 	public string WhisperLanguage = "";
 	public bool Dictation = true;
+	// Live dictation: every phrase is turned into this language at once
+	// (Arthur 08.10: speak in any language, Russian with commas appears).
+	// "" = text as spoken.
+	public string DictationLanguage = "ru";
 	public bool Button = true;
 	// The "Оформление ВКЛ/ВЫКЛ" pill next to the ✨ button.
 	public bool Toggle = true;
@@ -979,6 +983,7 @@ public class Config {
 					result.WhisperModel = Str(json, "whisper_model", result.WhisperModel);
 					result.WhisperLanguage = Str(json, "whisper_language", result.WhisperLanguage);
 					result.Dictation = Bool(json, "dictation", true);
+					result.DictationLanguage = Str(json, "dictation_language", result.DictationLanguage);
 					object budget;
 					if (json.TryGetValue("enter_budget_ms", out budget) && budget is int) result.EnterBudgetMs = Math.Max(1000, (int)budget);
 					object prefer;
@@ -1846,6 +1851,8 @@ public static class Engines {
 		});
 	}
 
+	[ThreadStatic] public static string EffortOverride;
+
 	static Answer AskChatModel(Config config, string model, string prompt, out int status, out string message) {
 		var answer = new Answer { Engine = "Groq" };
 		status = 0;
@@ -1864,7 +1871,8 @@ public static class Engines {
 				{ "temperature", 0.4 },
 				{ "messages", new object[] { new Dictionary<string, object> { { "role", "user" }, { "content", prompt } } } },
 			};
-			if (model == config.Model && model.Contains("gpt-oss") && config.GroqEffort.Length > 0) body["reasoning_effort"] = config.GroqEffort;
+			if (model.Contains("gpt-oss") && !string.IsNullOrEmpty(EffortOverride)) body["reasoning_effort"] = EffortOverride;
+			else if (model == config.Model && model.Contains("gpt-oss") && config.GroqEffort.Length > 0) body["reasoning_effort"] = config.GroqEffort;
 			else if (model.Contains("gpt-oss")) body["reasoning_effort"] = "low";
 			else if (model.Contains("qwen")) body["reasoning_effort"] = "none";
 			// Free Qwen allows 1000 output tokens a minute; without a cap Groq
@@ -3302,7 +3310,8 @@ public class TrayApp : ApplicationContext {
 		var quiet = Math.Max(200, peak * 0.12);
 		var silent = 0;
 		for (var f = frames - 1; f >= segment && FrameRms(pcm, f) < quiet; --f) ++silent;
-		if (silent >= 9 && frames - silent - segment >= 6) return frames - silent + 4; // a pause after speech
+		// a pause after speech; 0.75 s: shorter phrases came out garbled (08.10)
+		if (silent >= 15 && frames - silent - segment >= 10) return frames - silent + 4;
 		if (frames - segment >= 180) { // 9 s without a pause: cut at the quietest spot of the last 2 s
 			var cut = frames - 1;
 			for (var f = frames - 40; f < frames; ++f) if (FrameRms(pcm, f) < FrameRms(pcm, cut)) cut = f;
@@ -3312,8 +3321,39 @@ public class TrayApp : ApplicationContext {
 		return -1;
 	}
 
+	// One dictated phrase in Russian (or DictationLanguage): natural, with
+	// the commas it needs, and Arthur's rules: no ? ! : ; and no period at
+	// the end. Any failure: the phrase goes in as spoken.
+	public static string ToLanguage(Config config, string phrase, string before) {
+		var language = config.DictationLanguage == "ru" ? "Russian" : config.DictationLanguage;
+		var prompt = "Turn this dictated phrase into natural " + language + " text, as a native speaker would type it in a Telegram chat. "
+			+ "If it is in another language, translate it; if it is already " + language + ", only fix recognition errors. "
+			+ "Keep the meaning, names, brands, slang and profanity. Commas only where they are really needed. "
+			+ "Never use ? ! : ; and do not end with a period. The phrase continues the text before it: do not repeat that text.\n"
+			+ (before.Trim().Length > 0 ? "Text before: " + (before.Length > 400 ? before.Substring(before.Length - 400) : before).Trim() + "\n" : "")
+			+ "Phrase:\n<<<\n" + phrase + "\n>>>\nAnswer with the " + language + " text only.";
+		try {
+			Engines.EffortOverride = "low";
+			var answer = Engines.AskChat(config, config.Model, prompt);
+			if (answer.Error.Length > 0 || string.IsNullOrWhiteSpace(answer.Text)) {
+				Log.Write("dictation translate: " + answer.Error);
+				return phrase;
+			}
+			var text = answer.Text.Trim().Trim('<', '>').Trim();
+			text = Regex.Replace(text, "[?!;]", "");
+			text = Regex.Replace(text, "(?<!\\d):|:(?!\\d)", "");
+			text = Regex.Replace(text, "(?<!\\.)\\.\\s*$", "");
+			return text.Trim();
+		} catch (Exception e) {
+			Log.Write("dictation translate: " + e.Message);
+			return phrase;
+		} finally {
+			Engines.EffortOverride = null;
+		}
+	}
+
 	// Whisper makes these up on silence.
-	static readonly Regex Hallucination = new Regex("^(продолжение следует|субтитры|редактор субтитров|спасибо за просмотр|thank you|thanks for watching|you)[\\s\\S]{0,60}$", RegexOptions.IgnoreCase);
+	static readonly Regex Hallucination = new Regex("^(продолжение следует|субтитры|редактор субтитров|спасибо за просмотр|thank you|thanks for watching|subtitles by|amara|you)[\\s\\S]{0,60}$", RegexOptions.IgnoreCase);
 
 	void LiveDictation(IntPtr window, LiveMic live) {
 		var config = CurrentConfig();
@@ -3343,6 +3383,7 @@ public class TrayApp : ApplicationContext {
 				if (status == 429) { restUntil[model] = DateTime.Now.AddSeconds(20); continue; }
 				if (answer.Error.Length > 0) { Show("\U0001F399 " + answer.Error, window, 4000); return false; }
 				var text = answer.Text.Trim();
+				if (text.Length > 0 && !Hallucination.IsMatch(text) && config.DictationLanguage.Length > 0) text = ToLanguage(config, text, dictated.ToString());
 				if (text.Length == 0 || Hallucination.IsMatch(text)) return true;
 				if (pending.Length > 0 || dictated.Length > 0) pending.Append(' ');
 				pending.Append(text);
@@ -3578,8 +3619,10 @@ public static class Program {
 			int status;
 			var watch = Stopwatch.StartNew();
 			var answer = Whisper.Transcribe(config, Recorder.Wav(pcm, from * 1600, Math.Min(pcm.Length, till * 1600) - from * 1600), config.WhisperModel, context, out status);
-			context += " " + answer.Text;
-			report.AppendLine(string.Format("phrase {0:0.00}-{1:0.00} s, cut seen at {2:0.0} s, whisper {3} ms: {4}{5}", from / 20.0, till / 20.0, at / 20.0, watch.ElapsedMilliseconds, answer.Text, answer.Error));
+			var whisperMs = watch.ElapsedMilliseconds;
+			var ru = config.DictationLanguage.Length > 0 && answer.Text.Length > 0 ? TrayApp.ToLanguage(config, answer.Text, context) : answer.Text;
+			context += " " + ru;
+			report.AppendLine(string.Format("phrase {0:0.00}-{1:0.00} s, cut seen at {2:0.0} s, whisper {3} ms, total {4} ms: {5} => {6}{7}", from / 20.0, till / 20.0, at / 20.0, whisperMs, watch.ElapsedMilliseconds, answer.Text, ru, answer.Error));
 		};
 		for (var frames = 2; frames <= pcm.Length / 1600; frames += 2) {
 			var cut = TrayApp.FindCut(pcm, frames, ref segment);
