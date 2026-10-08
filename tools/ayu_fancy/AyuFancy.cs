@@ -2313,6 +2313,7 @@ public static class Native {
 public class SparkButton : Form {
 	public Action Clicked;
 	public Action<int, int> Moved; // new offset from the bottom right, 100% scale
+	public Action<int, int> Moving; // screen px the button just moved by while dragged
 	bool _hover;
 	bool _busy;
 	bool _dragging;
@@ -2420,7 +2421,12 @@ public class SparkButton : Form {
 			if (Math.Abs(now.X - _pressAt.X) > 4 || Math.Abs(now.Y - _pressAt.Y) > 4) _dragging = true;
 		}
 		if (_dragging) {
-			Location = new Point(Location.X + e.X - _dragFrom.X, Location.Y + e.Y - _dragFrom.Y);
+			var dx = e.X - _dragFrom.X;
+			var dy = e.Y - _dragFrom.Y;
+			if (dx != 0 || dy != 0) {
+				Location = new Point(Location.X + dx, Location.Y + dy);
+				if (Moving != null) Moving(dx, dy);
+			}
 		}
 		base.OnMouseMove(e);
 	}
@@ -2451,6 +2457,8 @@ public class EnterToggle : Form {
 	public Action Clicked;
 	public const int BaseWidth = 152;
 	public const int BaseHeight = 26;
+	public const int GroupGap = 4; // px between pill, 🎙 and ✨ at 100% scale
+	public const int GroupStep = 34 + GroupGap; // ✨ to 🎙
 	bool _on = true;
 	bool _hover;
 
@@ -2496,20 +2504,17 @@ public class EnterToggle : Form {
 
 	// Top centre of the AyuGram window, in the empty title strip, so it never
 	// covers messages (ayu-fancy-pill-top-v1, Arthur 08.10: «its in my face»).
-	// Dragged with the mouse: x, y from the client top left at 100% scale.
-	public void Place(Rectangle client, float scale, int x, int y) {
+	// One block with 🎙 and ✨ (ayu-fancy-group-v1): the pill sits left of 🎙,
+	// right and bottom = offset of ✨ from the client bottom right, 100% scale.
+	public void Place(Rectangle client, float scale, int right, int bottom) {
 		if (_dragging) return;
 		_scale = scale;
 		Client = client;
 		var size = new Size((int)Math.Round(BaseWidth * scale), (int)Math.Round(BaseHeight * scale));
+		var button = (int)Math.Round(34 * scale);
 		var location = new Point(
-			client.Left + (client.Width - size.Width) / 2,
-			client.Top + (int)Math.Round(3 * scale));
-		if (x >= 0 && y >= 0) {
-			location = new Point(
-				Math.Max(client.Left, Math.Min(client.Right - size.Width, client.Left + (int)Math.Round(x * scale))),
-				Math.Max(client.Top, Math.Min(client.Bottom - size.Height, client.Top + (int)Math.Round(y * scale))));
-		}
+			client.Right - (int)Math.Round((right + GroupStep + GroupGap) * scale) - button - size.Width,
+			client.Bottom - (int)Math.Round(bottom * scale) - button + (button - size.Height) / 2);
 		if (Size != size) {
 			Size = size;
 			// Rounded shape as the window region: no colour key, so no pink fringe.
@@ -2557,6 +2562,7 @@ public class EnterToggle : Form {
 	protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
 
 	public Action<int, int> Moved; // new x, y from the client top left, 100% scale
+	public Action<int, int> Moving; // screen px the pill just moved by while dragged
 	public Rectangle Client;
 	float _scale = 1f;
 	bool _pressed;
@@ -2585,7 +2591,12 @@ public class EnterToggle : Form {
 			if (Math.Abs(now.X - _pressAt.X) > 4 || Math.Abs(now.Y - _pressAt.Y) > 4) _dragging = true;
 		}
 		if (_dragging) {
-			Location = new Point(Location.X + e.X - _dragFrom.X, Location.Y + e.Y - _dragFrom.Y);
+			var dx = e.X - _dragFrom.X;
+			var dy = e.Y - _dragFrom.Y;
+			if (dx != 0 || dy != 0) {
+				Location = new Point(Location.X + dx, Location.Y + dy);
+				if (Moving != null) Moving(dx, dy);
+			}
 		}
 		base.OnMouseMove(e);
 	}
@@ -2732,8 +2743,6 @@ public class TrayApp : ApplicationContext {
 		_tray.ContextMenuStrip.Items.Add(_onEnter);
 		_tray.ContextMenuStrip.Items.Add("Настройки", null, (s, e) => OpenFile("ayu_fancy.json"));
 		_tray.ContextMenuStrip.Items.Add("Кнопки и пилюлю на место", null, (s, e) => {
-			SaveSetting("pill_x", -1);
-			SaveSetting("pill_y", -1);
 			SaveButtonPlace(14, 145);
 		});
 		_tray.ContextMenuStrip.Items.Add("Лог", null, (s, e) => OpenFile("ayu_fancy.log"));
@@ -2741,16 +2750,22 @@ public class TrayApp : ApplicationContext {
 		_button = new SparkButton();
 		_mic = new SparkButton { Glyph = "\U0001F399" };
 		_mic.Clicked = () => ToggleDictation(_target);
-		_mic.Moved = (right, bottom) => SaveButtonPlace(right - 40, bottom);
+		_mic.Moving = (dx, dy) => { MoveBy(_button, dx, dy); MoveBy(_toggle, dx, dy); };
+		_button.Moving = (dx, dy) => { MoveBy(_mic, dx, dy); MoveBy(_toggle, dx, dy); };
+		_mic.Moved = (right, bottom) => SaveButtonPlace(right - EnterToggle.GroupStep, bottom);
 		_button.Clicked = () => StartRun(_target, Trigger.Button);
 		_button.Moved = SaveButtonPlace;
 		// The pill is the one master switch (ayu-fancy-pill-master-v1).
 		_toggle = new EnterToggle { On = _master.Checked };
 		_toggle.Clicked = TogglePill;
+		_toggle.Moving = (dx, dy) => { MoveBy(_mic, dx, dy); MoveBy(_button, dx, dy); };
+		// the whole block is saved as the place of ✨, worked out from the pill
 		_toggle.Moved = (x, y) => {
-			SaveSetting("pill_x", Math.Max(0, x));
-			SaveSetting("pill_y", Math.Max(0, y));
-			Log.Write("pill moved to " + x + "," + y);
+			var c = _toggle.Client;
+			var scale = _toggle.Width / (float)EnterToggle.BaseWidth;
+			var right = (int)Math.Round((c.Right - _toggle.Right) / scale) - EnterToggle.GroupGap - 34 - EnterToggle.GroupGap - 34;
+			var bottom = (int)Math.Round((c.Bottom - _toggle.Bottom) / scale) - (34 - EnterToggle.BaseHeight) / 2;
+			SaveButtonPlace(right, bottom);
 		};
 		_follow = new System.Windows.Forms.Timer { Interval = 150 };
 		_follow.Tick += (s, e) => Follow();
@@ -3102,8 +3117,12 @@ public class TrayApp : ApplicationContext {
 		} catch {
 		}
 		_target = window;
+		// the block [pill][🎙][✨] stays inside the window whole
+		var groupWidth = EnterToggle.BaseWidth + EnterToggle.GroupGap + EnterToggle.GroupStep + 34;
+		var right = Math.Max(0, Math.Min(config.ButtonRight, (int)(rect.Right / scale) - groupWidth));
+		var bottom = Math.Max(0, Math.Min(config.ButtonBottom, (int)(rect.Bottom / scale) - 34));
 		// always left of 🎙's place, so the pill never jumps
-		_toggle.Place(client, scale, config.PillX, config.PillY);
+		_toggle.Place(client, scale, right, bottom);
 		if (!_toggle.Visible) _toggle.Show();
 		if (!config.Enabled) {
 			if (_button.Visible && _busy == 0) _button.Hide();
@@ -3112,14 +3131,14 @@ public class TrayApp : ApplicationContext {
 		}
 		if (config.Button) {
 			_button.Client = client;
-			_button.Place(client, scale, config.ButtonRight, config.ButtonBottom);
+			_button.Place(client, scale, right, bottom);
 			if (!_button.Visible) _button.Show();
 		} else if (_button.Visible && _busy == 0) {
 			_button.Hide();
 		}
 		if (config.Dictation) {
 			_mic.Client = client;
-			_mic.Place(client, scale, config.ButtonRight + 40, config.ButtonBottom);
+			_mic.Place(client, scale, right + EnterToggle.GroupStep, bottom);
 			if (!_mic.Visible) _mic.Show();
 		} else if (_mic.Visible && !_recording) {
 			_mic.Hide();
@@ -3145,6 +3164,10 @@ public class TrayApp : ApplicationContext {
 		} catch (Exception e) {
 			Log.Write("setting not saved: " + e.Message);
 		}
+	}
+
+	static void MoveBy(Form form, int dx, int dy) {
+		if (form.Visible) form.Location = new Point(form.Location.X + dx, form.Location.Y + dy);
 	}
 
 	void SaveButtonPlace(int right, int bottom) {
