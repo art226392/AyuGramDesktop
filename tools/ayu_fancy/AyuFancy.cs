@@ -2910,7 +2910,7 @@ public class TrayApp : ApplicationContext {
 
 	// Pause in typing before the text is formatted in the background: 450 ms
 	// often missed the moment before Enter (ayu-fancy-prefetch-fast-v1).
-	const int PrefetchPauseMs = 200;
+	const int PrefetchPauseMs = 350; // 200 burned Groq's day limit by noon (08.10)
 
 	static bool Worth(string text) {
 		return HasWords(text, 2) && text.IndexOf('\uFFFC') < 0 && text.Length < 4000;
@@ -3311,10 +3311,11 @@ public class TrayApp : ApplicationContext {
 		var silent = 0;
 		for (var f = frames - 1; f >= segment && FrameRms(pcm, f) < quiet; --f) ++silent;
 		// a pause after speech; 0.75 s: shorter phrases came out garbled (08.10)
-		if (silent >= 15 && frames - silent - segment >= 10) return frames - silent + 4;
-		if (frames - segment >= 180) { // 9 s without a pause: cut at the quietest spot of the last 2 s
+		// 08.10 evening: 0.5 s and at most 4 s, Arthur talks without long pauses
+		if (silent >= 10 && frames - silent - segment >= 10) return frames - silent + 4;
+		if (frames - segment >= 80) { // 4 s without a pause: cut at the quietest spot of the last 1.5 s
 			var cut = frames - 1;
-			for (var f = frames - 40; f < frames; ++f) if (FrameRms(pcm, f) < FrameRms(pcm, cut)) cut = f;
+			for (var f = frames - 30; f < frames; ++f) if (FrameRms(pcm, f) < FrameRms(pcm, cut)) cut = f;
 			return cut;
 		}
 		if (silent >= 40) segment = frames - 10; // long silence: skip it
@@ -3332,23 +3333,60 @@ public class TrayApp : ApplicationContext {
 			+ "Never use ? ! : ; and do not end with a period. The phrase continues the text before it: do not repeat that text.\n"
 			+ (before.Trim().Length > 0 ? "Text before: " + (before.Length > 400 ? before.Substring(before.Length - 400) : before).Trim() + "\n" : "")
 			+ "Phrase:\n<<<\n" + phrase + "\n>>>\nAnswer with the " + language + " text only.";
+		// Groq first (better Russian than Google in tests); Google Translate
+		// when every Groq model is on its day limit (08.10 11:53 the phrases
+		// came raw, lowercase and without punctuation).
 		try {
 			Engines.EffortOverride = "low";
 			var answer = Engines.AskChat(config, config.Model, prompt);
 			if (answer.Error.Length > 0 || string.IsNullOrWhiteSpace(answer.Text)) {
-				Log.Write("dictation translate: " + answer.Error);
-				return phrase;
+				Log.Write("dictation translate: " + answer.Error + ", Google instead");
+				var google = GoogleTranslate(phrase, config.DictationLanguage);
+				return google != null ? CleanMarks(google) : phrase;
 			}
-			var text = answer.Text.Trim().Trim('<', '>').Trim();
-			text = Regex.Replace(text, "[?!;]", "");
-			text = Regex.Replace(text, "(?<!\\d):|:(?!\\d)", "");
-			text = Regex.Replace(text, "(?<!\\.)\\.\\s*$", "");
-			return text.Trim();
+			return CleanMarks(answer.Text.Trim().Trim('<', '>').Trim());
 		} catch (Exception e) {
 			Log.Write("dictation translate: " + e.Message);
 			return phrase;
 		} finally {
 			Engines.EffortOverride = null;
+		}
+	}
+
+	static string GoogleTranslate(string text, string language) {
+		try {
+			Engines.TuneNet();
+			var url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&dt=t&tl=" + Uri.EscapeDataString(language) + "&q=" + Uri.EscapeDataString(text);
+			var request = (HttpWebRequest)WebRequest.Create(url);
+			request.KeepAlive = true;
+			request.Timeout = 4000;
+			string body;
+			using (var response = (HttpWebResponse)request.GetResponse())
+			using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8)) body = reader.ReadToEnd();
+			var json = new JavaScriptSerializer().DeserializeObject(body) as object[];
+			var parts = json != null ? json[0] as object[] : null;
+			if (parts == null) return null;
+			var result = new StringBuilder();
+			foreach (var part in parts) {
+				var piece = part as object[];
+				if (piece != null && piece.Length > 0 && piece[0] is string) result.Append((string)piece[0]);
+			}
+			return result.Length > 0 ? result.ToString() : null;
+		} catch (Exception e) {
+			Log.Write("google translate: " + e.Message);
+			return null;
+		}
+	}
+
+	// Arthur's rules: no ? ! : ; (times like 19:00 stay), no period at the end.
+	static string CleanMarks(string text) {
+		try {
+			text = Regex.Replace(text, "[?!;]", "");
+			text = Regex.Replace(text, "(?<!\\d):|:(?!\\d)", "");
+			text = Regex.Replace(text, "(?<!\\.)\\.\\s*$", "");
+			return text.Trim();
+		} catch {
+			return text;
 		}
 	}
 
