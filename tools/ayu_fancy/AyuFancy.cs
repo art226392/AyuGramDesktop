@@ -1065,6 +1065,20 @@ public static class Recorder {
 		try { Command("close ayurec"); } catch { }
 	}
 
+	// 16 kHz mono 16-bit PCM as a WAV file.
+	public static byte[] Wav(byte[] pcm, int offset, int count) {
+		var stream = new MemoryStream();
+		var writer = new BinaryWriter(stream);
+		writer.Write(Encoding.ASCII.GetBytes("RIFF")); writer.Write(36 + count);
+		writer.Write(Encoding.ASCII.GetBytes("WAVEfmt ")); writer.Write(16);
+		writer.Write((short)1); writer.Write((short)1); writer.Write(16000); writer.Write(32000);
+		writer.Write((short)2); writer.Write((short)16);
+		writer.Write(Encoding.ASCII.GetBytes("data")); writer.Write(count);
+		writer.Write(pcm, offset, count);
+		writer.Flush();
+		return stream.ToArray();
+	}
+
 	// One second of silence, for the key check in AYU_FANCY.cmd.
 	public static byte[] SilenceWav() {
 		var stream = new MemoryStream();
@@ -1081,16 +1095,110 @@ public static class Recorder {
 	}
 }
 
+// Microphone straight into memory (waveIn, 100 ms buffers, polled): live
+// dictation reads the sound while recording goes on. MCI could only save
+// the whole recording at the end.
+public class LiveMic {
+	[StructLayout(LayoutKind.Sequential)]
+	struct WaveFormat { public short Tag, Channels; public int Rate, BytesPerSec; public short Align, Bits, Extra; }
+	[StructLayout(LayoutKind.Sequential)]
+	struct WaveHdr { public IntPtr Data; public int Length, Recorded; public IntPtr User; public int Flags, Loops; public IntPtr Next, Reserved; }
+	[DllImport("winmm.dll")] static extern int waveInOpen(out IntPtr handle, int device, ref WaveFormat format, IntPtr callback, IntPtr instance, int flags);
+	[DllImport("winmm.dll")] static extern int waveInPrepareHeader(IntPtr handle, IntPtr header, int size);
+	[DllImport("winmm.dll")] static extern int waveInUnprepareHeader(IntPtr handle, IntPtr header, int size);
+	[DllImport("winmm.dll")] static extern int waveInAddBuffer(IntPtr handle, IntPtr header, int size);
+	[DllImport("winmm.dll")] static extern int waveInStart(IntPtr handle);
+	[DllImport("winmm.dll")] static extern int waveInReset(IntPtr handle);
+	[DllImport("winmm.dll")] static extern int waveInClose(IntPtr handle);
+
+	const int BufferBytes = 3200; // 100 ms
+	IntPtr _handle;
+	readonly List<IntPtr> _headers = new List<IntPtr>();
+	readonly MemoryStream _pcm = new MemoryStream();
+	readonly object _lock = new object();
+	volatile bool _running;
+	Thread _poller;
+
+	public void Start() {
+		var format = new WaveFormat { Tag = 1, Channels = 1, Rate = 16000, BytesPerSec = 32000, Align = 2, Bits = 16 };
+		var error = waveInOpen(out _handle, -1, ref format, IntPtr.Zero, IntPtr.Zero, 0);
+		if (error != 0) throw new Exception("микрофон не открылся (waveIn " + error + ")");
+		var size = Marshal.SizeOf(typeof(WaveHdr));
+		for (var i = 0; i < 20; ++i) {
+			var header = Marshal.AllocHGlobal(size);
+			Marshal.StructureToPtr(new WaveHdr { Data = Marshal.AllocHGlobal(BufferBytes), Length = BufferBytes }, header, false);
+			waveInPrepareHeader(_handle, header, size);
+			waveInAddBuffer(_handle, header, size);
+			_headers.Add(header);
+		}
+		_running = true;
+		waveInStart(_handle);
+		_poller = new Thread(Poll) { IsBackground = true };
+		_poller.Start();
+	}
+
+	void Poll() {
+		var size = Marshal.SizeOf(typeof(WaveHdr));
+		while (_running) {
+			Collect(size, true);
+			Thread.Sleep(30);
+		}
+	}
+
+	void Collect(int size, bool requeue) {
+		foreach (var header in _headers) {
+			var h = (WaveHdr)Marshal.PtrToStructure(header, typeof(WaveHdr));
+			if ((h.Flags & 1) == 0) continue; // WHDR_DONE
+			if (h.Recorded > 0) {
+				var bytes = new byte[h.Recorded];
+				Marshal.Copy(h.Data, bytes, 0, h.Recorded);
+				lock (_lock) _pcm.Write(bytes, 0, bytes.Length);
+			}
+			waveInUnprepareHeader(_handle, header, size);
+			if (!requeue) continue;
+			Marshal.StructureToPtr(new WaveHdr { Data = h.Data, Length = BufferBytes }, header, false);
+			waveInPrepareHeader(_handle, header, size);
+			waveInAddBuffer(_handle, header, size);
+		}
+	}
+
+	public byte[] Snapshot() {
+		lock (_lock) return _pcm.ToArray();
+	}
+
+	public void Stop() {
+		if (!_running) return;
+		_running = false;
+		if (_poller != null) _poller.Join(500);
+		waveInReset(_handle); // hands back the buffers, partly filled ones too
+		Collect(Marshal.SizeOf(typeof(WaveHdr)), false);
+		waveInClose(_handle);
+		foreach (var header in _headers) {
+			var h = (WaveHdr)Marshal.PtrToStructure(header, typeof(WaveHdr));
+			Marshal.FreeHGlobal(h.Data);
+			Marshal.FreeHGlobal(header);
+		}
+		_headers.Clear();
+	}
+}
+
 public static class Whisper {
 	public static Answer Transcribe(Config config, byte[] wav) {
+		int status;
+		return Transcribe(config, wav, config.WhisperModel, null, out status);
+	}
+
+	// Live dictation: one phrase; the text dictated so far as context keeps
+	// names and style the same across phrases.
+	public static Answer Transcribe(Config config, byte[] wav, string model, string context, out int status) {
+		status = 0;
 		var answer = new Answer { Engine = "Whisper" };
 		if (string.IsNullOrEmpty(config.Key)) {
 			answer.Error = "для диктовки нужен бесплатный ключ Groq, запусти AYU_FANCY.cmd";
 			return answer;
 		}
-		var status = 0;
 		try {
-			ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+			Engines.TuneNet(); // no Expect: 100-continue, one round trip less per phrase
 			var boundary = "----ayufancy" + Guid.NewGuid().ToString("N");
 			var request = (HttpWebRequest)WebRequest.Create(config.BaseUrl + "/audio/transcriptions");
 			request.Method = "POST";
@@ -1103,11 +1211,13 @@ public static class Whisper {
 				var bytes = Encoding.UTF8.GetBytes("--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + name + "\"\r\n\r\n" + value + "\r\n");
 				body.Write(bytes, 0, bytes.Length);
 			};
-			field("model", config.WhisperModel);
+			field("model", model);
 			field("response_format", "json");
 			field("temperature", "0");
 			if (!string.IsNullOrEmpty(config.WhisperLanguage)) field("language", config.WhisperLanguage);
-			field("prompt", "Привет! Это сообщение в Telegram, с заглавными буквами и пунктуацией. Hi, English words stay in English.");
+			var hint = "Привет! Это сообщение в Telegram, с заглавными буквами и пунктуацией. Hi, English words stay in English.";
+			if (!string.IsNullOrEmpty(context)) hint = context.Length > 300 ? context.Substring(context.Length - 300) : context;
+			field("prompt", hint);
 			var head = Encoding.UTF8.GetBytes("--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"speech.wav\"\r\nContent-Type: audio/wav\r\n\r\n");
 			body.Write(head, 0, head.Length);
 			body.Write(wav, 0, wav.Length);
@@ -2668,6 +2778,10 @@ public class TrayApp : ApplicationContext {
 				CancelDictation();
 				return (IntPtr)1;
 			}
+			if (_recording && key == Native.VK_RETURN) {
+				try { _mic.BeginInvoke(new Action(() => ToggleDictation(_micWindow))); } catch { }
+				return (IntPtr)1;
+			}
 			if (key == 0x20 && config.Dictation
 				&& Native.Down(Native.VK_CONTROL)
 				&& Native.Down(Native.VK_SHIFT)
@@ -3123,86 +3237,182 @@ public class TrayApp : ApplicationContext {
 		return Regex.Matches(text, "[\\p{L}\\p{N}]+").Count >= count;
 	}
 
-	// Click on the mic (or Ctrl+Shift+Space): start; again: stop, Whisper,
-	// the text goes into the field at the caret. Esc while recording: cancel.
+	// Click on the mic (or Ctrl+Shift+Space): start; again: stop. Arthur
+	// 08.10: words must appear in the field while he speaks. Every phrase
+	// (a pause of ~0.45 s, or 9 s of talk) goes to Whisper at once and lands
+	// at the caret; then the first Enter only fixes the text, the second sends.
+	LiveMic _live;
+	volatile bool _dictationCancel;
+	volatile bool _dictated;
+	volatile string _sendNext;
+
 	void ToggleDictation(IntPtr window) {
 		if (_recording) {
-			_recording = false;
+			_recording = false; // the live worker finishes the last phrase
 			_mic.Recording = false;
-			if (Interlocked.CompareExchange(ref _transcribing, 1, 0) != 0) return;
-			var target = _micWindow;
-			// MCI belongs to the thread that opened the device (this UI thread):
-			// stopped from a worker it answered "device is not open" (06.10 14:10).
-			string recorded;
-			try {
-				recorded = Recorder.Stop();
-			} catch (Exception e) {
-				Log.Write("mic stop: " + e.Message);
-				Show("\U0001F399 Запись не сохранилась: " + e.Message, target, 4000);
-				Recorder.Cancel();
-				Interlocked.Exchange(ref _transcribing, 0);
-				return;
-			}
-			var worker = new Thread(() => FinishDictation(target, recorded));
-			worker.SetApartmentState(ApartmentState.STA);
-			worker.IsBackground = true;
-			worker.Start();
 			return;
 		}
-		if (_transcribing != 0 || window == IntPtr.Zero) return;
+		if (window == IntPtr.Zero || Interlocked.CompareExchange(ref _transcribing, 1, 0) != 0) return;
+		var live = new LiveMic();
 		try {
-			Recorder.Start();
+			live.Start();
 		} catch (Exception e) {
 			Log.Write("mic: " + e.Message);
-			Show("\U0001F399 Микрофон не открылся: " + e.Message, window, 5000);
+			Show("\U0001F399 " + e.Message, window, 5000);
+			Interlocked.Exchange(ref _transcribing, 0);
 			return;
 		}
+		_live = live;
+		Engines.WarmGroq(CurrentConfig()); // the first phrase took 6.5 s on a cold connection
 		_micWindow = window;
+		_dictationCancel = false;
 		_recording = true;
 		_mic.Recording = true;
-		Show("\U0001F399 Говори\u2026  Клик по \U0001F399 или Ctrl+Shift+Пробел: готово, Esc: отмена", window, 0);
+		Show("\U0001F399 Говори, слова появятся сами\u2026  \U0001F399, Enter или Ctrl+Shift+Пробел: готово, Esc: стоп", window, 0);
+		var worker = new Thread(() => LiveDictation(window, live));
+		worker.SetApartmentState(ApartmentState.STA);
+		worker.IsBackground = true;
+		worker.Start();
 	}
 
 	void CancelDictation() {
+		_dictationCancel = true;
 		_recording = false;
-		// on the UI thread, where the device was opened
-		try { _mic.BeginInvoke(new Action(() => { _mic.Recording = false; Recorder.Cancel(); })); } catch { }
-		Show("\U0001F399 Отменено", _micWindow, 1500);
+		try { _mic.BeginInvoke(new Action(() => { _mic.Recording = false; })); } catch { }
+		Show("\U0001F399 Остановлено", _micWindow, 1500);
 	}
 
-	void FinishDictation(IntPtr window, string path) {
-		try {
-			Show("\U0001F399 Распознаю\u2026", window, 0);
-			var watch = Stopwatch.StartNew();
-			var answer = Whisper.Transcribe(CurrentConfig(), File.ReadAllBytes(path));
-			if (answer.Error.Length > 0) {
-				Show("\U0001F399 " + answer.Error, window, 5000);
-				return;
+	// Loudness of 50 ms frames (800 samples).
+	public static double FrameRms(byte[] pcm, int frame) {
+		double sum = 0;
+		var from = frame * 1600;
+		for (var i = from; i + 1 < from + 1600 && i + 1 < pcm.Length; i += 2) {
+			var v = (short)(pcm[i] | (pcm[i + 1] << 8));
+			sum += v * (double)v;
+		}
+		return Math.Sqrt(sum / 800);
+	}
+
+	// Where the phrase being spoken ends (a frame), or -1 while it goes on.
+	public static int FindCut(byte[] pcm, int frames, ref int segment) {
+		if (frames - segment < 12) return -1;
+		// quiet = clearly below the loud part of this phrase
+		var peak = 0.0;
+		for (var f = segment; f < frames; ++f) peak = Math.Max(peak, FrameRms(pcm, f));
+		var quiet = Math.Max(200, peak * 0.12);
+		var silent = 0;
+		for (var f = frames - 1; f >= segment && FrameRms(pcm, f) < quiet; --f) ++silent;
+		if (silent >= 9 && frames - silent - segment >= 6) return frames - silent + 4; // a pause after speech
+		if (frames - segment >= 180) { // 9 s without a pause: cut at the quietest spot of the last 2 s
+			var cut = frames - 1;
+			for (var f = frames - 40; f < frames; ++f) if (FrameRms(pcm, f) < FrameRms(pcm, cut)) cut = f;
+			return cut;
+		}
+		if (silent >= 40) segment = frames - 10; // long silence: skip it
+		return -1;
+	}
+
+	// Whisper makes these up on silence.
+	static readonly Regex Hallucination = new Regex("^(продолжение следует|субтитры|редактор субтитров|спасибо за просмотр|thank you|thanks for watching|you)[\\s\\S]{0,60}$", RegexOptions.IgnoreCase);
+
+	void LiveDictation(IntPtr window, LiveMic live) {
+		var config = CurrentConfig();
+		var watch = Stopwatch.StartNew();
+		var dictated = new StringBuilder();
+		var pending = new StringBuilder();
+		string savedClipboard = null;
+		var clipboardTaken = false;
+		var segment = 0; // first frame of the phrase being spoken
+		var phrases = 0;
+		var models = new List<string> { config.WhisperModel };
+		if (config.WhisperModel != "whisper-large-v3-turbo") models.Add("whisper-large-v3-turbo");
+		var restUntil = new Dictionary<string, DateTime>();
+		Func<byte[], int, int, bool> send = (pcm, from, till) => {
+			// a phrase with too little loud sound is noise or breath
+			var loud = 0;
+			var floor = 0.0;
+			for (var f = from; f < till; ++f) floor += FrameRms(pcm, f);
+			floor = Math.Max(250, floor / Math.Max(1, till - from) * 0.6);
+			for (var f = from; f < till; ++f) if (FrameRms(pcm, f) > floor) ++loud;
+			if (loud < 6) return true;
+			foreach (var model in models) {
+				DateTime until;
+				if (restUntil.TryGetValue(model, out until) && DateTime.Now < until) continue;
+				int status;
+				var answer = Whisper.Transcribe(config, Recorder.Wav(pcm, from * 1600, Math.Min(pcm.Length, till * 1600) - from * 1600), model, dictated.ToString(), out status);
+				if (status == 429) { restUntil[model] = DateTime.Now.AddSeconds(20); continue; }
+				if (answer.Error.Length > 0) { Show("\U0001F399 " + answer.Error, window, 4000); return false; }
+				var text = answer.Text.Trim();
+				if (text.Length == 0 || Hallucination.IsMatch(text)) return true;
+				if (pending.Length > 0 || dictated.Length > 0) pending.Append(' ');
+				pending.Append(text);
+				dictated.Append(' ').Append(text);
+				++phrases;
+				return true;
 			}
-			if (answer.Text.Length == 0) {
-				Show("\U0001F399 Ничего не расслышал", window, 2500);
-				return;
-			}
-			if (Native.GetForegroundWindow() != window) {
-				Native.SetForegroundWindow(window);
-				Thread.Sleep(120);
-			}
+			Show("\U0001F399 Whisper на лимите, подожди минуту", window, 4000);
+			return false;
+		};
+		Action flush = () => {
+			if (pending.Length == 0) return;
+			if (Native.GetForegroundWindow() != window) return; // back in AyuGram: goes in then
 			uint id;
 			Native.GetWindowThreadProcessId(window, out id);
 			var before = FieldReader.Read((int)id);
-			var text = answer.Text;
+			var text = pending.ToString().TrimStart();
 			if (!string.IsNullOrEmpty(before) && !char.IsWhiteSpace(before[before.Length - 1])) text = " " + text;
-			var saved = Retry<string>(() => Clipboard.ContainsText() ? Clipboard.GetText() : null, null);
+			if (!clipboardTaken) {
+				savedClipboard = Retry<string>(() => Clipboard.ContainsText() ? Clipboard.GetText() : null, null);
+				clipboardTaken = true;
+			}
 			RetryDo(() => Clipboard.SetText(text));
 			Native.Press(Native.VK_CONTROL, 'V');
-			Thread.Sleep(400);
-			RetryDo(() => { if (saved != null) Clipboard.SetText(saved); });
-			Show(string.Format("\U0001F399 Готово, {0:0.0} с. Enter оформит и отправит", watch.ElapsedMilliseconds / 1000.0), window, 2500);
+			Thread.Sleep(150);
+			pending.Length = 0;
+		};
+		try {
+			while (_recording) {
+				Thread.Sleep(100);
+				var pcm = live.Snapshot();
+				var frames = pcm.Length / 1600;
+				var cut = FindCut(pcm, frames, ref segment);
+				if (cut < 0) continue;
+				if (send(pcm, segment, cut)) segment = cut;
+				flush();
+			}
+			live.Stop();
+			if (!_dictationCancel) {
+				var pcm = live.Snapshot();
+				var frames = (pcm.Length + 1599) / 1600;
+				if (frames - segment >= 6) {
+					Show("\U0001F399 Дописываю\u2026", window, 0);
+					send(pcm, segment, frames);
+				}
+			}
+			if (pending.Length > 0 && Native.GetForegroundWindow() != window) {
+				Native.SetForegroundWindow(window);
+				Thread.Sleep(150);
+			}
+			flush();
+			if (phrases == 0) {
+				if (!_dictationCancel) Show("\U0001F399 Ничего не расслышал", window, 2500);
+				return;
+			}
+			_dictated = true;
+			Log.Write(string.Format("dictation: live, {0} phrases, {1:0.0} s", phrases, watch.ElapsedMilliseconds / 1000.0));
+			Show("\U0001F399 Готово. Enter: поправить текст, ещё Enter: отправить", window, 3000);
 		} catch (Exception e) {
 			Log.Write("dictation: " + e);
 			Show("\U0001F399 Ошибка: " + e.Message, window, 5000);
 		} finally {
-			if (path != null) { try { File.Delete(path); } catch { } }
+			try { live.Stop(); } catch { }
+			if (clipboardTaken) {
+				var text = savedClipboard;
+				Thread.Sleep(200);
+				RetryDo(() => { if (text != null) Clipboard.SetText(text); });
+			}
+			_recording = false;
+			try { _mic.BeginInvoke(new Action(() => { _mic.Recording = false; })); } catch { }
 			Interlocked.Exchange(ref _transcribing, 0);
 		}
 	}
@@ -3224,6 +3434,14 @@ public class TrayApp : ApplicationContext {
 				savedTaken = true;
 				var copied = CopyFromField(true);
 				text = copied != null ? copied.Text : null;
+			}
+			var sendNext = _sendNext;
+			_sendNext = null;
+			var preview = _dictated;
+			_dictated = false;
+			if (sendNext != null && text == sendNext) {
+				Native.Tap(Native.VK_RETURN); // second Enter after dictation: send
+				return;
 			}
 			if (text == null || !Worth(text)) {
 				Native.Tap(Native.VK_RETURN);
@@ -3250,12 +3468,22 @@ public class TrayApp : ApplicationContext {
 			var ok = result != null && result.Error.Length == 0 && result.Text != null;
 			Log.Write(string.Format("enter: uia {0}, waited {1} ms, job {2}, {3}", viaUia ? "ok" : "no", watch.ElapsedMilliseconds,
 				job.Done.WaitOne(0) ? "done" : "running", result == null ? "not ready" : (result.Error.Length > 0 ? result.Error : (result.Engine + " " + result.Milliseconds + " ms"))));
+			if (!ok && preview) {
+				_sendNext = text;
+				Show("\u2728 Не поправил (" + (result == null ? "не успел" : result.Error) + "). Enter: отправить как есть", window, 3000);
+				return;
+			}
 			if (!ok) {
 				Native.Tap(Native.VK_RETURN);
 				if (true) {
 					var reason = _sendAsIs.WaitOne(0) ? "по твоей команде" : result == null ? ("не успел за " + (config.EnterBudgetMs / 1000.0).ToString("0.#") + " с") : result.Error;
 					Show("\u2728 Отправил как есть: " + reason, window, 2500);
 				}
+				return;
+			}
+			if (result.Text.Text == text && result.Text.Tags.Count == 0 && preview) {
+				_sendNext = text;
+				Show("\u2728 Тут нечего править. Enter: отправить", window, 2000);
 				return;
 			}
 			if (result.Text.Text == text && result.Text.Tags.Count == 0) {
@@ -3272,6 +3500,12 @@ public class TrayApp : ApplicationContext {
 			Thread.Sleep(30);
 			Native.Press(Native.VK_CONTROL, 'V');
 			Thread.Sleep(120);
+			if (preview) {
+				Thread.Sleep(150);
+				_sendNext = viaUia ? FieldReader.Read(pid) : null;
+				Show("\u2728 Поправил. Enter: отправить", window, 2500);
+				return;
+			}
 			Native.Tap(Native.VK_RETURN);
 			Show(string.Format("\u2728 {0:0.0} с", watch.ElapsedMilliseconds / 1000.0), window, 1200);
 			Thread.Sleep(600);
@@ -3316,6 +3550,48 @@ public static class Program {
 		return result.Error.Length == 0 && result.Text != null && result.Text.Text.Length > 0 ? 0 : 1;
 	}
 
+	// --livetest <in.wav|mic:N> <out.txt>: phrase splitting of live dictation
+	// on a 16 kHz mono WAV fed in 100 ms steps (or N s of microphone), each
+	// phrase through Whisper, no field and no keys touched.
+	static int LiveTest(string input, string output) {
+		var report = new StringBuilder();
+		byte[] pcm;
+		if (input.StartsWith("mic:")) {
+			var mic = new LiveMic();
+			mic.Start();
+			Thread.Sleep(int.Parse(input.Substring(4)) * 1000);
+			mic.Stop();
+			pcm = mic.Snapshot();
+		} else {
+			var wav = File.ReadAllBytes(input);
+			pcm = new byte[wav.Length - 44];
+			Array.Copy(wav, 44, pcm, 0, pcm.Length);
+		}
+		report.AppendLine("seconds of sound: " + (pcm.Length / 32000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+		var peak = 0.0;
+		for (var f = 0; f < pcm.Length / 1600; ++f) peak = Math.Max(peak, TrayApp.FrameRms(pcm, f));
+		report.AppendLine("peak rms: " + (int)peak);
+		var config = Config.Load();
+		var segment = 0;
+		var context = "";
+		Action<int, int, int> send = (from, till, at) => {
+			int status;
+			var watch = Stopwatch.StartNew();
+			var answer = Whisper.Transcribe(config, Recorder.Wav(pcm, from * 1600, Math.Min(pcm.Length, till * 1600) - from * 1600), config.WhisperModel, context, out status);
+			context += " " + answer.Text;
+			report.AppendLine(string.Format("phrase {0:0.00}-{1:0.00} s, cut seen at {2:0.0} s, whisper {3} ms: {4}{5}", from / 20.0, till / 20.0, at / 20.0, watch.ElapsedMilliseconds, answer.Text, answer.Error));
+		};
+		for (var frames = 2; frames <= pcm.Length / 1600; frames += 2) {
+			var cut = TrayApp.FindCut(pcm, frames, ref segment);
+			if (cut < 0) continue;
+			send(segment, cut, frames);
+			segment = cut;
+		}
+		if (pcm.Length / 1600 - segment >= 6) send(segment, (pcm.Length + 1599) / 1600, pcm.Length / 1600);
+		File.WriteAllText(output, report.ToString(), new UTF8Encoding(false));
+		return 0;
+	}
+
 	// Autostart runs "AyuFancy.exe --guard": it starts AyuFancy and starts it
 	// again if it dies. On 06.10 at 18:01 Windows closed a hung AyuFancy and
 	// ✨, 🎙 and the pill were gone until the next logon. «Выход» in the tray
@@ -3355,6 +3631,7 @@ public static class Program {
 		if (args.Length == 1 && args[0] == "--guard") {
 			return Guard();
 		}
+		if (args.Length == 3 && args[0] == "--livetest") return LiveTest(args[1], args[2]);
 		if (args.Length == 3 && args[0] == "--selftest") {
 			return SelfTest(args[1], args[2]);
 		}
