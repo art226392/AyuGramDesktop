@@ -3181,7 +3181,7 @@ public class TrayApp : ApplicationContext {
 			}
 			_vtSet = want;
 		}
-		// Folded: only ✨ (or the pill when AyuFancy is off). The mouse over it
+		// Folded: only 🎙 and ✨ (or the pill when AyuFancy is off). The mouse over them
 		// opens all four, they fold again 0.7 s after the mouse leaves.
 		var px = (int)Math.Round(EnterToggle.ButtonSize * scale);
 		var sparkRight = client.Right - (int)Math.Round(right * scale);
@@ -3192,8 +3192,10 @@ public class TrayApp : ApplicationContext {
 			sparkBottom - px,
 			sparkRight + (int)Math.Round(vtUnits * scale),
 			sparkBottom);
+		// folded = 🎙 and ✨ side by side (Arthur 08.10: «what about the voice dictation, where that go»)
+		var micToo = config.Dictation ? (int)Math.Round(EnterToggle.GroupStep * scale) : 0;
 		var small = anchorIsSpark
-			? new Rectangle(sparkRight - px, sparkBottom - px, px, px)
+			? new Rectangle(sparkRight - px - micToo, sparkBottom - px, px + micToo, px)
 			: Rectangle.FromLTRB(full.Left, full.Top, full.Left + (int)Math.Round(EnterToggle.BaseWidth * scale), full.Bottom);
 		var now = DateTime.Now;
 		var area = _open ? full : small;
@@ -3218,7 +3220,7 @@ public class TrayApp : ApplicationContext {
 		} else if (_button.Visible && _busy == 0) {
 			_button.Hide();
 		}
-		if (config.Dictation && (_open || _recording)) {
+		if (config.Dictation) {
 			_mic.Client = client;
 			_mic.Place(client, scale, right + EnterToggle.GroupStep, bottom);
 			if (!_mic.Visible) _mic.Show();
