@@ -652,7 +652,8 @@ public static class Core {
 	public static string BuildCleanPrompt(string html, string extra) {
 		var result = new StringBuilder();
 		result.Append("You are a sharp, careful copy editor for Telegram messages. Return the same message, cleaned up so it reads like a literate native speaker typed it carefully:\n");
-		result.Append("- Correct capitalization and punctuation: commas before subordinate clauses and around introductory words, periods, question marks on real questions, dashes, «» quotes for Russian. Fix obvious typos and agreement errors.\n");
+		result.Append("- Correct capitalization. Commas: the bare minimum only, where leaving one out is a real mistake (before что, который, если, когда, потому что and the like, between two full clauses, after a name the author addresses). No commas around пж, короче, ну, вообще, кстати, типа and other filler words. When unsure, no comma.\n");
+		result.Append("- Never add ? ! : ; that the author did not type, even when the message sounds like a question. Never end the message, a paragraph or a line with a period. Fix obvious typos and agreement errors.\n");
 		result.Append("- Proper nouns and brand names get capitals (Слава, ПК, Telegram); casual slang words stay as they are (телега, пж, норм, ок).\n");
 		result.Append("- Readable whitespace: split a long message into short paragraphs by meaning with an empty line (<br><br>) between them; a short message stays one paragraph.\n");
 		result.Append("- When the author enumerates (во-первых / во-вторых, first / second, 1 2 3), put each point on its own line with a single <br>.\n");
@@ -665,8 +666,8 @@ public static class Core {
 		if (!string.IsNullOrWhiteSpace(extra)) {
 			result.Append("- Author's own wishes: " + extra.Trim() + "\n");
 		}
-		result.Append("\nExample 1\nMessage:\n<<<\nкороче я вчера доделал бота он теперь сам режет видео в кружки осталось звук починить но это мелочи\n>>>\nAnswer:\nКороче, я вчера доделал бота: он теперь сам режет видео в кружки.<br><br>Осталось звук починить, <i>но это мелочи</i>.\n\n");
-		result.Append("Example 2\nMessage:\n<<<\nслав глянь пж логи там опять ошибка во первых бот не отвечает во вторых телега тупит. ты когда будешь\n>>>\nAnswer:\nСлав, глянь, пж, логи: там опять ошибка.<br><br>Во-первых, бот не отвечает.<br>Во-вторых, телега тупит.<br><br>Ты когда будешь?\n\n");
+		result.Append("\nExample 1\nMessage:\n<<<\nкороче я вчера доделал бота он теперь сам режет видео в кружки осталось звук починить но это мелочи\n>>>\nAnswer:\nКороче я вчера доделал бота, он теперь сам режет видео в кружки<br><br>Осталось звук починить, <i>но это мелочи</i>\n\n");
+		result.Append("Example 2\nMessage:\n<<<\nслав глянь пж логи там опять ошибка во первых бот не отвечает во вторых телега тупит. ты когда будешь\n>>>\nAnswer:\nСлав, глянь пж логи, там опять ошибка<br><br>Во-первых бот не отвечает<br>Во-вторых телега тупит<br><br>Ты когда будешь\n\n");
 		result.Append("Now the real message.\nMessage:\n<<<\n" + html + "\n>>>\nAnswer:\n");
 		return result.ToString();
 	}
@@ -675,6 +676,32 @@ public static class Core {
 		return (code >= 0x1F300 && code <= 0x1FAFF) || (code >= 0x2600 && code <= 0x27BF)
 			|| (code >= 0x2B00 && code <= 0x2BFF) || code == 0xFE0F || code == 0x200D
 			|| (code >= 0x1F1E6 && code <= 0x1F1FF);
+	}
+
+	// Arthur 08.10: no ? ! : ; the author did not type (a mark counts as typed
+	// when the original has it right after the same word), times like 19:00
+	// stay, and no period at the end of a line or of the message.
+	static bool ExtraMark(string original, string text, int i, StringBuilder output) {
+		var c = text[i];
+		if (c == '.') {
+			if (i > 0 && text[i - 1] == '.') return false;
+			var k = i + 1;
+			if (k < text.Length && text[k] == '.') return false;
+			while (k < text.Length && (text[k] == ' ' || text[k] == '\t')) ++k;
+			return k >= text.Length || text[k] == '\n';
+		}
+		if (c != '?' && c != '!' && c != ':' && c != ';') return false;
+		if ((c == ':' || c == ';') && output.Length > 0 && char.IsDigit(output[output.Length - 1])
+			&& i + 1 < text.Length && char.IsDigit(text[i + 1])) return false;
+		// the word right before the mark, skipping spaces and repeated marks
+		var end = output.Length;
+		while (end > 0 && (output[end - 1] == ' ' || output[end - 1] == c)) --end;
+		var start = end;
+		while (start > 0 && char.IsLetterOrDigit(output[start - 1])) --start;
+		var word = output.ToString(start, end - start);
+		if (word.Length == 0) return original.IndexOf(c) < 0;
+		var mark = Regex.Escape(c.ToString());
+		return !Regex.IsMatch(original, "(?<![\\p{L}\\p{N}])" + Regex.Escape(word) + "[ " + mark + "]*" + mark, RegexOptions.IgnoreCase);
 	}
 
 	// Clean mode guarantees: no bold and no emoji the author did not type,
@@ -694,7 +721,12 @@ public static class Core {
 			var code = pair ? char.ConvertToUtf32(text, i) : text[i];
 			var width = pair ? 2 : 1;
 			var drop = IsEmojiCode(code) && !allowed.Contains(code);
-			if (drop) {
+			if (!drop && !pair) drop = ExtraMark(original.Text, text, i, output);
+			if (drop && !IsEmojiCode(code)) {
+				// "будешь ?" → "будешь": the space before a dropped mark goes too
+				var next = i + 1 < text.Length ? text[i + 1] : '\n';
+				if (output.Length > 0 && output[output.Length - 1] == ' ' && char.IsWhiteSpace(next)) output.Length -= 1;
+			} else if (drop) {
 				// The space before a removed emoji goes too when punctuation,
 				// a space or the line end follows.
 				var next = i + width < text.Length ? text[i + width] : '\n';
@@ -1725,6 +1757,9 @@ public static class Engines {
 			if (model == config.Model && model.Contains("gpt-oss") && config.GroqEffort.Length > 0) body["reasoning_effort"] = config.GroqEffort;
 			else if (model.Contains("gpt-oss")) body["reasoning_effort"] = "low";
 			else if (model.Contains("qwen")) body["reasoning_effort"] = "none";
+			// Free Qwen allows 1000 output tokens a minute; without a cap Groq
+			// counts the default maximum and answers 429 "Request too large".
+			if (model.Contains("qwen")) body["max_completion_tokens"] = 900;
 			var bytes = Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(body));
 			using (var stream = request.GetRequestStream()) {
 				stream.Write(bytes, 0, bytes.Length);
@@ -2295,7 +2330,7 @@ public class EnterToggle : Form {
 		Cursor = Cursors.Hand;
 		Size = new Size(BaseWidth, BaseHeight);
 		var tip = new ToolTip();
-		tip.SetToolTip(this, "Оформлять сообщение по Enter (Codex)\nКлик: включить или выключить");
+		tip.SetToolTip(this, "Клик: всё AyuFancy включить или выключить\n(оформление по Enter, ✨ и 🎙)");
 	}
 
 	protected override bool ShowWithoutActivation {
@@ -2368,7 +2403,7 @@ public class EnterToggle : Form {
 		using (var font = new Font("Segoe UI Semibold", h * 0.44f, GraphicsUnit.Pixel))
 		using (var brush = new SolidBrush(_on ? Color.White : Color.FromArgb(200, 200, 210))) {
 			var format = new StringFormat(StringFormatFlags.NoWrap) { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-			var text = _on ? "Оформление ВКЛ" : "Оформление ВЫКЛ";
+			var text = _on ? "AyuFancy ВКЛ" : "AyuFancy ВЫКЛ";
 			var area = _on ? new RectangleF(4, 0, Width - knob - 12, h) : new RectangleF(knob + 8, 0, Width - knob - 12, h);
 			g.DrawString(text, font, brush, area, format);
 		}
@@ -2420,10 +2455,12 @@ public class Prefetcher {
 		return _jobs.FirstOrDefault(j => j.Text == text);
 	}
 
-	// One background job at a time, so typing does not start a flood.
+	// Two background jobs at most: the newest text gets its own job even
+	// while an older one for a half-typed message still runs (08.10: the
+	// final text waited for that job, then Enter waited the full ~1.2 s).
 	public void Prefetch(string text, Config config) {
 		lock (_lock) {
-			if (Find(text) != null || _jobs.Any(j => !j.Done.WaitOne(0))) return;
+			if (Find(text) != null || _jobs.Count(j => !j.Done.WaitOne(0)) >= 2) return;
 		}
 		Start(text, config);
 	}
@@ -2503,7 +2540,6 @@ public class TrayApp : ApplicationContext {
 		_onEnter.CheckedChanged += (s, e) => {
 			if (_syncing) return;
 			SaveSetting("on_enter", _onEnter.Checked);
-			_toggle.On = _onEnter.Checked;
 		};
 		_tray.ContextMenuStrip.Items.Add(_onEnter);
 		_tray.ContextMenuStrip.Items.Add("Настройки", null, (s, e) => OpenFile("ayu_fancy.json"));
@@ -2515,8 +2551,9 @@ public class TrayApp : ApplicationContext {
 		_mic.Moved = (right, bottom) => SaveButtonPlace(right - 40, bottom);
 		_button.Clicked = () => StartRun(_target, Trigger.Button);
 		_button.Moved = SaveButtonPlace;
-		_toggle = new EnterToggle { On = _onEnter.Checked };
-		_toggle.Clicked = ToggleEnter;
+		// The pill is the one master switch (ayu-fancy-pill-master-v1).
+		_toggle = new EnterToggle { On = _master.Checked };
+		_toggle.Clicked = TogglePill;
 		_follow = new System.Windows.Forms.Timer { Interval = 150 };
 		_follow.Tick += (s, e) => Follow();
 		_follow.Start();
@@ -2552,6 +2589,7 @@ public class TrayApp : ApplicationContext {
 		_master.Checked = on;
 		_syncing = false;
 		_tray.Icon = MakeIcon(on);
+		if (_toggle != null) _toggle.On = on;
 		_tray.Text = on ? "AyuFancy: Ctrl+Shift+F в AyuGram" : "AyuFancy выключен: Ctrl+Shift+F12";
 		Show(on ? "\u2728 AyuFancy включён" : "AyuFancy выключен (Ctrl+Shift+F12 вернуть)", IntPtr.Zero, 1800);
 		Log.Write("master " + (on ? "on" : "off"));
@@ -2700,7 +2738,7 @@ public class TrayApp : ApplicationContext {
 		var changedAt = DateTime.Now;
 		while (true) {
 			try {
-				Thread.Sleep(150);
+				Thread.Sleep(100);
 				var now = DateTime.Now;
 				if ((now - lastConfig).TotalSeconds >= 2 || _cfg == null) {
 					_cfg = Config.Load();
@@ -2739,7 +2777,7 @@ public class TrayApp : ApplicationContext {
 					changedAt = now;
 					continue;
 				}
-				if ((now - changedAt).TotalMilliseconds >= 450 && Worth(text)) {
+				if ((now - changedAt).TotalMilliseconds >= PrefetchPauseMs && Worth(text)) {
 					_pre.Prefetch(text, config);
 				}
 			} catch (Exception e) {
@@ -2747,6 +2785,10 @@ public class TrayApp : ApplicationContext {
 			}
 		}
 	}
+
+	// Pause in typing before the text is formatted in the background: 450 ms
+	// often missed the moment before Enter (ayu-fancy-prefetch-fast-v1).
+	const int PrefetchPauseMs = 200;
 
 	static bool Worth(string text) {
 		return HasWords(text, 2) && text.IndexOf('\uFFFC') < 0 && text.Length < 4000;
@@ -2787,6 +2829,20 @@ public class TrayApp : ApplicationContext {
 		}
 	}
 
+	// Arthur 08.10: one obvious switch next to ✨ and 🎙 that definitely turns
+	// everything off and on. On also turns formatting on Enter back on, so
+	// «ВКЛ» on the pill always means Enter formats.
+	void TogglePill() {
+		var on = !CurrentConfig().Enabled;
+		if (on && !CurrentConfig().OnEnter) {
+			SaveSetting("on_enter", true);
+			_syncing = true;
+			_onEnter.Checked = true;
+			_syncing = false;
+		}
+		SetEnabled(on);
+	}
+
 	// The pill: formatting on Enter on or off, same setting as the tray item.
 	void ToggleEnter() {
 		var on = !CurrentConfig().OnEnter;
@@ -2815,9 +2871,9 @@ public class TrayApp : ApplicationContext {
 			_syncing = false;
 			_tray.Icon = MakeIcon(config.Enabled);
 		}
-		var show = config.Enabled
-			&& (config.Button || config.Toggle || config.Dictation)
-			&& window != IntPtr.Zero
+		_toggle.On = config.Enabled;
+		// the pill stays in sight when everything is off, to turn it back on
+		var show = window != IntPtr.Zero
 			&& IsAppWindow(window, out appPid)
 			&& Native.IsWindowVisible(window)
 			&& !Native.IsIconic(window);
@@ -2844,6 +2900,14 @@ public class TrayApp : ApplicationContext {
 		} catch {
 		}
 		_target = window;
+		// always left of 🎙's place, so the pill never jumps
+		_toggle.Place(client, scale, config.ButtonRight + 40, config.ButtonBottom);
+		if (!_toggle.Visible) _toggle.Show();
+		if (!config.Enabled) {
+			if (_button.Visible && _busy == 0) _button.Hide();
+			if (_mic.Visible && !_recording) _mic.Hide();
+			return;
+		}
 		if (config.Button) {
 			_button.Client = client;
 			_button.Place(client, scale, config.ButtonRight, config.ButtonBottom);
@@ -2862,14 +2926,6 @@ public class TrayApp : ApplicationContext {
 			_syncing = true;
 			_onEnter.Checked = config.OnEnter;
 			_syncing = false;
-		}
-		if (config.Toggle) {
-			_toggle.On = config.OnEnter;
-			// left of 🎙 when dictation is on, else left of ✨
-			_toggle.Place(client, scale, config.ButtonRight + (config.Dictation ? 40 : 0), config.ButtonBottom);
-			if (!_toggle.Visible) _toggle.Show();
-		} else if (_toggle.Visible) {
-			_toggle.Hide();
 		}
 	}
 
