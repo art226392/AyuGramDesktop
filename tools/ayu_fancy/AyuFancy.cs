@@ -3202,7 +3202,9 @@ public class TrayApp : ApplicationContext {
 		area.Inflate((int)Math.Round(6 * scale), (int)Math.Round(6 * scale));
 		if (area.Contains(Cursor.Position) || _vtGroup.HasValue) _hoverAt = now;
 		_open = !config.Compact || now - _hoverAt < TimeSpan.FromMilliseconds(700);
-		var pill = _open || !anchorIsSpark;
+		// ayu-fancy-off-hidden-v1: AyuFancy off = nothing over AyuGram (Arthur 10.10: «in my face»);
+		// back on from the tray icon or Ctrl+Shift+F12
+		var pill = config.Enabled && (_open || !anchorIsSpark);
 		// always left of 🎙's place, so the pill never jumps
 		_toggle.Place(client, scale, right, bottom);
 		if (pill && !_toggle.Visible) _toggle.Show();
