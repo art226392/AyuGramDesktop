@@ -2324,6 +2324,197 @@ public static class Native {
 // Round ✨ button glued to the AyuGram window above the send button.
 // Never takes the focus, so the message field stays active for the click.
 // Right mouse button drags it, the place is remembered.
+// Glass look for ✨, 🎙 and the pill (ayu-fancy-glass-v1, Arthur 14.10: «2026 style»):
+// per-pixel alpha layered windows, so the round edges are smooth on any
+// background (no colour key, no pink or jagged rim), vector icons instead of
+// monochrome emoji, dark glass with a thin light rim, violet accent.
+public static class Glass {
+	[StructLayout(LayoutKind.Sequential)] struct SIZE { public int cx, cy; }
+	[StructLayout(LayoutKind.Sequential)] struct POINT { public int x, y; }
+	[StructLayout(LayoutKind.Sequential, Pack = 1)] struct BLEND { public byte Op, Flags, Alpha, Format; }
+	[DllImport("user32.dll", SetLastError = true)]
+	static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, IntPtr pptDst, ref SIZE size, IntPtr hdcSrc, ref POINT pptSrc, int key, ref BLEND blend, int flags);
+	[DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
+	[DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
+	[DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+	[DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+	[DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+	[DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+
+	public const int WS_EX_LAYERED = 0x00080000;
+	public static readonly Color Accent1 = Color.FromArgb(167, 139, 250); // violet 400
+	public static readonly Color Accent2 = Color.FromArgb(99, 102, 241);  // indigo 500
+
+	public static void Push(Form form, Action<Graphics, int, int> draw) {
+		if (form == null || !form.IsHandleCreated || form.IsDisposed) return;
+		int w = form.Width, h = form.Height;
+		if (w <= 0 || h <= 0) return;
+		using (var bmp = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppArgb)) {
+			using (var g = Graphics.FromImage(bmp)) {
+				g.Clear(Color.Transparent);
+				g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+				g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+				g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+				draw(g, w, h);
+			}
+			var screen = GetDC(IntPtr.Zero);
+			var mem = CreateCompatibleDC(screen);
+			var hbmp = bmp.GetHbitmap(Color.FromArgb(0)); // premultiplied ARGB
+			var old = SelectObject(mem, hbmp);
+			try {
+				var size = new SIZE { cx = w, cy = h };
+				var src = new POINT();
+				var blend = new BLEND { Op = 0, Flags = 0, Alpha = 255, Format = 1 }; // AC_SRC_ALPHA
+				UpdateLayeredWindow(form.Handle, screen, IntPtr.Zero, ref size, mem, ref src, 0, ref blend, 2); // ULW_ALPHA
+			} finally {
+				SelectObject(mem, old);
+				DeleteObject(hbmp);
+				DeleteDC(mem);
+				ReleaseDC(IntPtr.Zero, screen);
+			}
+		}
+	}
+
+	public static System.Drawing.Drawing2D.GraphicsPath Pill(RectangleF r) {
+		var path = new System.Drawing.Drawing2D.GraphicsPath();
+		var d = r.Height;
+		if (r.Width <= d + 0.01f) {
+			path.AddEllipse(r);
+			return path;
+		}
+		path.AddArc(r.Left, r.Top, d, d, 90, 180);
+		path.AddArc(r.Right - d, r.Top, d, d, 270, 180);
+		path.CloseFigure();
+		return path;
+	}
+
+	// Dark glass body: soft vertical gradient, thin light rim, faint top sheen.
+	public static void Body(Graphics g, RectangleF r, bool hover) {
+		using (var path = Pill(r))
+		using (var fill = new System.Drawing.Drawing2D.LinearGradientBrush(r,
+			hover ? Color.FromArgb(240, 52, 52, 66) : Color.FromArgb(232, 38, 38, 50),
+			hover ? Color.FromArgb(240, 30, 30, 42) : Color.FromArgb(232, 20, 20, 28), 90f)) {
+			g.FillPath(fill, path);
+		}
+		Rim(g, r, hover ? 70 : 42);
+	}
+
+	// Accent body: violet to indigo, used by ✨ and by "on" switches.
+	public static void Accent(Graphics g, RectangleF r, bool hover, Color a, Color b) {
+		using (var path = Pill(r))
+		using (var fill = new System.Drawing.Drawing2D.LinearGradientBrush(r,
+			hover ? Lighten(a, 0.15f) : a, hover ? Lighten(b, 0.15f) : b, 45f)) {
+			g.FillPath(fill, path);
+		}
+		Rim(g, r, hover ? 90 : 60);
+	}
+
+	static void Rim(Graphics g, RectangleF r, int alpha) {
+		var inner = new RectangleF(r.X + 0.5f, r.Y + 0.5f, r.Width - 1f, r.Height - 1f);
+		using (var path = Pill(inner))
+		using (var pen = new Pen(Color.FromArgb(alpha, 255, 255, 255), 1f)) {
+			g.DrawPath(pen, path);
+		}
+	}
+
+	public static Color Lighten(Color c, float k) {
+		return Color.FromArgb(c.A, c.R + (int)((255 - c.R) * k), c.G + (int)((255 - c.G) * k), c.B + (int)((255 - c.B) * k));
+	}
+
+	// Four-point sparkle plus a small one, like the ✨ emoji but crisp at 22 px.
+	public static void Sparkle(Graphics g, float cx, float cy, float s, Color color) {
+		using (var brush = new SolidBrush(color)) {
+			Star(g, brush, cx - s * 0.05f, cy + s * 0.05f, s * 0.30f);
+			Star(g, brush, cx + s * 0.19f, cy - s * 0.19f, s * 0.12f);
+		}
+	}
+
+	static void Star(Graphics g, Brush brush, float cx, float cy, float r) {
+		var k = r * 0.22f; // waist of the curved sides
+		var p = new System.Drawing.Drawing2D.GraphicsPath();
+		p.AddBezier(cx, cy - r, cx + k * 0.3f, cy - k, cx + k, cy - k * 0.3f, cx + r, cy);
+		p.AddBezier(cx + r, cy, cx + k, cy + k * 0.3f, cx + k * 0.3f, cy + k, cx, cy + r);
+		p.AddBezier(cx, cy + r, cx - k * 0.3f, cy + k, cx - k, cy + k * 0.3f, cx - r, cy);
+		p.AddBezier(cx - r, cy, cx - k, cy - k * 0.3f, cx - k * 0.3f, cy - k, cx, cy - r);
+		p.CloseFigure();
+		g.FillPath(brush, p);
+		p.Dispose();
+	}
+
+	// Microphone: capsule, cradle arc and stem.
+	public static void Mic(Graphics g, float cx, float cy, float s, Color color) {
+		var w = s * 0.20f;
+		var h = s * 0.32f;
+		var top = cy - s * 0.27f;
+		using (var brush = new SolidBrush(color))
+		using (var cap = Pill(new RectangleF(0, 0, h, w))) {
+			// vertical capsule: draw a horizontal pill rotated
+			var state = g.Save();
+			g.TranslateTransform(cx, top + h / 2);
+			g.RotateTransform(90);
+			g.TranslateTransform(-h / 2, -w / 2);
+			g.FillPath(brush, cap);
+			g.Restore(state);
+		}
+		var stroke = Math.Max(1.2f, s * 0.07f);
+		using (var pen = new Pen(color, stroke)) {
+			pen.StartCap = pen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+			var aw = s * 0.36f;
+			var arcTop = top + h * 0.35f;
+			g.DrawArc(pen, cx - aw / 2, arcTop, aw, h * 0.85f, 0, 180);
+			var stemTop = arcTop + h * 0.85f;
+			g.DrawLine(pen, cx, stemTop, cx, stemTop + s * 0.09f);
+		}
+	}
+
+	public static void Stop(Graphics g, float cx, float cy, float s, Color color) {
+		var a = s * 0.30f;
+		using (var brush = new SolidBrush(color))
+		using (var path = Rounded(new RectangleF(cx - a / 2, cy - a / 2, a, a), a * 0.25f)) {
+			g.FillPath(brush, path);
+		}
+	}
+
+	public static void Dots(Graphics g, float cx, float cy, float s, Color color) {
+		var d = Math.Max(2f, s * 0.11f);
+		using (var brush = new SolidBrush(color)) {
+			for (var i = -1; i <= 1; i++) g.FillEllipse(brush, cx + i * d * 1.7f - d / 2, cy - d / 2, d, d);
+		}
+	}
+
+	public static System.Drawing.Drawing2D.GraphicsPath Rounded(RectangleF r, float radius) {
+		var p = new System.Drawing.Drawing2D.GraphicsPath();
+		var d = radius * 2;
+		p.AddArc(r.Left, r.Top, d, d, 180, 90);
+		p.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+		p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+		p.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
+		p.CloseFigure();
+		return p;
+	}
+
+	// iOS-like switch: track and knob.
+	public static void Switch(Graphics g, RectangleF track, bool on, bool hover) {
+		if (on) {
+			Accent(g, track, hover, Accent1, Accent2);
+		} else {
+			using (var path = Pill(track))
+			using (var brush = new SolidBrush(Color.FromArgb(hover ? 80 : 60, 255, 255, 255))) {
+				g.FillPath(brush, path);
+			}
+		}
+		var inset = Math.Max(1.5f, track.Height * 0.14f);
+		var knob = track.Height - inset * 2;
+		var x = on ? track.Right - inset - knob : track.Left + inset;
+		using (var shadow = new SolidBrush(Color.FromArgb(60, 0, 0, 0))) {
+			g.FillEllipse(shadow, x, track.Top + inset + 0.6f, knob, knob);
+		}
+		using (var brush = new SolidBrush(on ? Color.White : Color.FromArgb(205, 205, 215))) {
+			g.FillEllipse(brush, x, track.Top + inset, knob, knob);
+		}
+	}
+}
+
 public class SparkButton : Form {
 	public Action Clicked;
 	public Action<int, int> Moved; // new offset from the bottom right, 100% scale
@@ -2339,8 +2530,6 @@ public class SparkButton : Form {
 		ShowInTaskbar = false;
 		TopMost = true;
 		StartPosition = FormStartPosition.Manual;
-		BackColor = Color.Magenta;
-		TransparencyKey = Color.Magenta;
 		DoubleBuffered = true;
 		Cursor = Cursors.Hand;
 		Size = new Size(38, 38);
@@ -2355,7 +2544,7 @@ public class SparkButton : Form {
 	protected override CreateParams CreateParams {
 		get {
 			var result = base.CreateParams;
-			result.ExStyle |= 0x08000000 | 0x00000080 | 0x00000008; // NOACTIVATE, TOOLWINDOW, TOPMOST
+			result.ExStyle |= 0x08000000 | 0x00000080 | 0x00000008 | Glass.WS_EX_LAYERED; // NOACTIVATE, TOOLWINDOW, TOPMOST, per-pixel alpha
 			return result;
 		}
 	}
@@ -2375,12 +2564,12 @@ public class SparkButton : Form {
 
 	public bool Recording {
 		get { return _recording; }
-		set { _recording = value; Invalidate(); }
+		set { _recording = value; Redraw(); }
 	}
 
 	public bool Busy {
 		get { return _busy; }
-		set { _busy = value; Invalidate(); }
+		set { _busy = value; Redraw(); }
 	}
 
 	public bool Dragging {
@@ -2398,22 +2587,31 @@ public class SparkButton : Form {
 		if (Location != location) Location = location;
 	}
 
-	protected override void OnPaint(PaintEventArgs e) {
-		var g = e.Graphics;
-		g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-		g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-		var color = _recording ? Color.FromArgb(230, 60, 70) : _busy ? Color.FromArgb(110, 110, 130) : _hover ? Color.FromArgb(160, 105, 255) : Color.FromArgb(132, 82, 240);
-		using (var brush = new SolidBrush(color)) {
-			g.FillEllipse(brush, 1, 1, Width - 3, Height - 3);
-		}
-		using (var font = new Font("Segoe UI Emoji", Height * 0.5f, GraphicsUnit.Pixel)) {
-			var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-			g.DrawString(_busy && !_recording ? "\u2026" : _recording ? "\u25A0" : Glyph, font, Brushes.White, new RectangleF(0, 1, Width - 1, Height - 1), format);
-		}
+	protected override void OnPaint(PaintEventArgs e) { }
+	protected override void OnPaintBackground(PaintEventArgs e) { }
+	protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Redraw(); }
+	protected override void OnSizeChanged(EventArgs e) { base.OnSizeChanged(e); Redraw(); }
+	protected override void OnVisibleChanged(EventArgs e) { base.OnVisibleChanged(e); if (Visible) Redraw(); }
+
+	// ✨: violet glass with a white sparkle; 🎙: dark glass with a mic;
+	// recording: red with a stop square; busy: dark glass with three dots.
+	public void Redraw() {
+		Glass.Push(this, (g, w, h) => {
+			var r = new RectangleF(0.5f, 0.5f, w - 1f, h - 1f);
+			var mic = Glyph != "\u2728";
+			if (_recording) Glass.Accent(g, r, _hover, Color.FromArgb(248, 113, 113), Color.FromArgb(220, 38, 38));
+			else if (_busy || mic) Glass.Body(g, r, _hover);
+			else Glass.Accent(g, r, _hover, Glass.Accent1, Glass.Accent2);
+			float cx = w / 2f, cy = h / 2f, size = h;
+			if (_recording) Glass.Stop(g, cx, cy, size, Color.White);
+			else if (_busy) Glass.Dots(g, cx, cy, size, Color.FromArgb(220, 220, 235));
+			else if (mic) Glass.Mic(g, cx, cy + size * 0.02f, size, Color.FromArgb(236, 236, 246));
+			else Glass.Sparkle(g, cx, cy, size, Color.White);
+		});
 	}
 
-	protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
-	protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
+	protected override void OnMouseEnter(EventArgs e) { _hover = true; Redraw(); base.OnMouseEnter(e); }
+	protected override void OnMouseLeave(EventArgs e) { _hover = false; Redraw(); base.OnMouseLeave(e); }
 
 	bool _pressed;
 	Point _pressAt;
@@ -2482,7 +2680,6 @@ public class EnterToggle : Form {
 		ShowInTaskbar = false;
 		TopMost = true;
 		StartPosition = FormStartPosition.Manual;
-		BackColor = Color.FromArgb(36, 32, 48);
 		DoubleBuffered = true;
 		Cursor = Cursors.Hand;
 		Size = new Size(BaseWidth, BaseHeight);
@@ -2497,7 +2694,7 @@ public class EnterToggle : Form {
 	protected override CreateParams CreateParams {
 		get {
 			var result = base.CreateParams;
-			result.ExStyle |= 0x08000000 | 0x00000080 | 0x00000008; // NOACTIVATE, TOOLWINDOW, TOPMOST
+			result.ExStyle |= 0x08000000 | 0x00000080 | 0x00000008 | Glass.WS_EX_LAYERED; // NOACTIVATE, TOOLWINDOW, TOPMOST, per-pixel alpha
 			return result;
 		}
 	}
@@ -2514,7 +2711,7 @@ public class EnterToggle : Form {
 
 	public bool On {
 		get { return _on; }
-		set { if (_on != value) { _on = value; Invalidate(); } }
+		set { if (_on != value) { _on = value; Redraw(); } }
 	}
 
 	// Top centre of the AyuGram window, in the empty title strip, so it never
@@ -2530,52 +2727,35 @@ public class EnterToggle : Form {
 		var location = new Point(
 			client.Right - (int)Math.Round((right + GroupStep + GroupGap) * scale) - button - size.Width,
 			client.Bottom - (int)Math.Round(bottom * scale) - button + (button - size.Height) / 2);
-		if (Size != size) {
-			Size = size;
-			// Rounded shape as the window region: no colour key, so no pink fringe.
-			using (var path = Pill(new Rectangle(0, 0, size.Width, size.Height))) {
-				Region = new Region(path);
-			}
-		}
+		if (Size != size) Size = size; // round shape = alpha of the glass bitmap, no region
 		if (Location != location) Location = location;
 	}
 
-	static System.Drawing.Drawing2D.GraphicsPath Pill(Rectangle r) {
-		var path = new System.Drawing.Drawing2D.GraphicsPath();
-		var d = r.Height;
-		path.AddArc(r.Left, r.Top, d, d, 90, 180);
-		path.AddArc(r.Right - d, r.Top, d, d, 270, 180);
-		path.CloseFigure();
-		return path;
+	protected override void OnPaint(PaintEventArgs e) { }
+	protected override void OnPaintBackground(PaintEventArgs e) { }
+	protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Redraw(); }
+	protected override void OnSizeChanged(EventArgs e) { base.OnSizeChanged(e); Redraw(); }
+	protected override void OnVisibleChanged(EventArgs e) { base.OnVisibleChanged(e); if (Visible) Redraw(); }
+
+	// Dark glass pill: switch on the left (violet = on), "AyuFancy" label.
+	public void Redraw() {
+		Glass.Push(this, (g, w, h) => {
+			var r = new RectangleF(0.5f, 0.5f, w - 1f, h - 1f);
+			Glass.Body(g, r, _hover);
+			var th = h * 0.54f;
+			var track = new RectangleF(h * 0.27f, (h - th) / 2f, th * 1.75f, th);
+			Glass.Switch(g, track, _on, _hover);
+			using (var font = new Font("Segoe UI Semibold", h * 0.44f, GraphicsUnit.Pixel))
+			using (var brush = new SolidBrush(_on ? Color.FromArgb(242, 242, 250) : Color.FromArgb(150, 150, 168))) {
+				var format = new StringFormat(StringFormatFlags.NoWrap) { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+				var left = track.Right + h * 0.15f;
+				g.DrawString("AyuFancy", font, brush, new RectangleF(left, 0.5f, w - left - h * 0.3f, h), format);
+			}
+		});
 	}
 
-	protected override void OnPaint(PaintEventArgs e) {
-		var g = e.Graphics;
-		g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-		g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-		var fill = _on
-			? (_hover ? Color.FromArgb(160, 105, 255) : Color.FromArgb(132, 82, 240))
-			: (_hover ? Color.FromArgb(78, 78, 90) : Color.FromArgb(58, 58, 68));
-		g.Clear(fill);
-		var h = Height;
-		// switch knob: right and white when on, left and grey when off
-		var pad = Math.Max(3, h / 6);
-		var knob = h - pad * 2;
-		var knobX = _on ? Width - knob - pad - 1 : pad + 1;
-		using (var brush = new SolidBrush(_on ? Color.White : Color.FromArgb(150, 150, 160))) {
-			g.FillEllipse(brush, knobX, pad, knob, knob);
-		}
-		using (var font = new Font("Segoe UI Semibold", h * 0.45f, GraphicsUnit.Pixel))
-		using (var brush = new SolidBrush(_on ? Color.White : Color.FromArgb(200, 200, 210))) {
-			var format = new StringFormat(StringFormatFlags.NoWrap) { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-			var text = _on ? "AyuFancy ВКЛ" : "AyuFancy ВЫКЛ";
-			var area = _on ? new RectangleF(4, 0, Width - knob - 12, h) : new RectangleF(knob + 8, 0, Width - knob - 12, h);
-			g.DrawString(text, font, brush, area, format);
-		}
-	}
-
-	protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
-	protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
+	protected override void OnMouseEnter(EventArgs e) { _hover = true; Redraw(); base.OnMouseEnter(e); }
+	protected override void OnMouseLeave(EventArgs e) { _hover = false; Redraw(); base.OnMouseLeave(e); }
 
 	public Action<int, int> Moved; // new x, y from the client top left, 100% scale
 	public Action<int, int> Moving; // screen px the pill just moved by while dragged
