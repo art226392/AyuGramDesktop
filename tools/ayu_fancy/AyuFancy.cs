@@ -2918,7 +2918,8 @@ public class TrayApp : ApplicationContext {
 		// Master switch (ayu-fancy-master-v1): off = no buttons, no Enter
 		// formatting, no prefetch, no dictation; keys pass straight through.
 		// Ctrl+Shift+F12 anywhere or a left click on the tray icon flips it.
-		SaveSetting("enabled", true);
+		// Off stays off after a restart or update (ayu-fancy-off-sticky-v1, Arthur 14.10:
+		// an update turned it back on and the buttons popped over the message field).
 		SaveSetting("on_enter", true);
 		_master = new ToolStripMenuItem("AyuFancy включён (Ctrl+Shift+F12)") { CheckOnClick = true, Checked = Config.Load().Enabled };
 		_master.CheckedChanged += (s, e) => {
