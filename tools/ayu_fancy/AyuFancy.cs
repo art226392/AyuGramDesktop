@@ -653,9 +653,10 @@ public static class Core {
 		var result = new StringBuilder();
 		result.Append("You are a sharp, careful copy editor for Telegram messages. Return the same message, cleaned up so it reads like a literate native speaker typed it carefully:\n");
 		result.Append("- Correct capitalization. Commas: the bare minimum only, where leaving one out is a real mistake (before что, который, если, когда, потому что and the like, between two full clauses, after a name the author addresses). No commas around пж, короче, ну, вообще, кстати, типа and other filler words. When unsure, no comma.\n");
+		result.Append("- Sentences: where one thought ends and the next begins, put a period and start the next sentence with a capital, even in a short one-line message (\"тест форматирования нахуй такие дела\" → \"Тест форматирования. Нахуй такие дела\"). Do not glue separate sentences with a comma or leave them run-on.\n");
 		result.Append("- Never add ? ! : ; that the author did not type, even when the message sounds like a question. Never end the message, a paragraph or a line with a period. Fix obvious typos and agreement errors.\n");
 		result.Append("- Proper nouns and brand names get capitals (Слава, ПК, Telegram); casual slang words stay as they are (телега, пж, норм, ок).\n");
-		result.Append("- Readable whitespace: split a long message into short paragraphs by meaning with an empty line (<br><br>) between them; a short message stays one paragraph.\n");
+		result.Append("- Readable whitespace: only a long message (more than about 30 words) is split into short paragraphs by meaning with an empty line (<br><br>) between them. A shorter message stays on one line, its sentences separated by periods (\"Бот опять завис. Я его перезапустил, вроде работает\").\n");
 		result.Append("- When the author enumerates (во-первых / во-вторых, first / second, 1 2 3), put each point on its own line with a single <br>.\n");
 		result.Append("- <i>Italics</i> sparingly, only where emphasis, a term, a title or an aside really fits.\n");
 		result.Append("- Only a long message with clearly different parts gets headings: <h1>, <h2>, <h3> on their own lines.\n");
@@ -666,8 +667,9 @@ public static class Core {
 		if (!string.IsNullOrWhiteSpace(extra)) {
 			result.Append("- Author's own wishes: " + extra.Trim() + "\n");
 		}
-		result.Append("\nExample 1\nMessage:\n<<<\nкороче я вчера доделал бота он теперь сам режет видео в кружки осталось звук починить но это мелочи\n>>>\nAnswer:\nКороче я вчера доделал бота, он теперь сам режет видео в кружки<br><br>Осталось звук починить, <i>но это мелочи</i>\n\n");
+		result.Append("\nExample 1\nMessage:\n<<<\nкороче я вчера доделал бота он теперь сам режет видео в кружки осталось звук починить но это мелочи\n>>>\nAnswer:\nКороче я вчера доделал бота, он теперь сам режет видео в кружки. Осталось звук починить, <i>но это мелочи</i>\n\n");
 		result.Append("Example 2\nMessage:\n<<<\nслав глянь пж логи там опять ошибка во первых бот не отвечает во вторых телега тупит. ты когда будешь\n>>>\nAnswer:\nСлав, глянь пж логи, там опять ошибка<br><br>Во-первых бот не отвечает<br>Во-вторых телега тупит<br><br>Ты когда будешь\n\n");
+		result.Append("Example 3\nMessage:\n<<<\nну все сделал проверяй завтра скажешь как оно\n>>>\nAnswer:\nНу все, сделал. Проверяй, завтра скажешь как оно\n\n");
 		result.Append("Now the real message.\nMessage:\n<<<\n" + html + "\n>>>\nAnswer:\n");
 		return result.ToString();
 	}
