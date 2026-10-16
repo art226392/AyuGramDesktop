@@ -938,6 +938,14 @@ public class Config {
 	// ayu-fancy-compact-v1: only ✨ is seen, the mouse over it opens all four
 	public bool Compact = true;
 	public int PillY = -1;
+	// «Aя» translate button in the AyuGram title strip (ayu-fancy-translate-v1).
+	// Shown even when AyuFancy is off; translate:false hides it.
+	public bool Translate = true;
+	public string DeepLKey = ""; // official DeepL API key; Free keys end with ":fx"
+	public string TranslateToEn = "EN-US";
+	public string TranslateToRu = "RU";
+	public int TranslateRight = 140; // 100%-scale px from the client right edge
+	public int TranslateTop = 4;     // 100%-scale px from the client top
 	public List<string> Apps = new List<string> { "ayugram", "telegram", "64gram", "kotatogram", "materialgram", "exteragram" };
 
 	public static string Folder() {
@@ -1004,6 +1012,12 @@ public class Config {
 					if (json.TryGetValue("button_bottom", out number) && number is int) result.ButtonBottom = (int)number;
 					if (json.TryGetValue("pill_x", out number) && number is int) result.PillX = (int)number;
 					if (json.TryGetValue("pill_y", out number) && number is int) result.PillY = (int)number;
+					result.Translate = Bool(json, "translate", true);
+					result.DeepLKey = Str(json, "deepl_key", result.DeepLKey);
+					result.TranslateToEn = Str(json, "translate_to_en", result.TranslateToEn);
+					result.TranslateToRu = Str(json, "translate_to_ru", result.TranslateToRu);
+					if (json.TryGetValue("translate_right", out number) && number is int) result.TranslateRight = (int)number;
+					if (json.TryGetValue("translate_top", out number) && number is int) result.TranslateTop = (int)number;
 					object apps;
 					if (json.TryGetValue("apps", out apps) && apps is object[]) {
 						result.Apps = ((object[])apps).OfType<string>().Select(a => a.ToLowerInvariant()).ToList();
@@ -2330,6 +2344,95 @@ public static class Native {
 // per-pixel alpha layered windows, so the round edges are smooth on any
 // background (no colour key, no pink or jagged rim), vector icons instead of
 // monochrome emoji, dark glass with a thin light rim, violet accent.
+// Translation for the «Aя» button (ayu-fancy-translate-v1, Arthur 16.10: DeepL
+// in AyuGram instead of copy → DeepL site → paste). Russian goes to English,
+// anything else to Russian. The official DeepL API when deepl_key is set; the
+// unofficial DLX/DeepLX route impersonates DeepL's iOS app and DeepL answers
+// it with 429, so it is not used. Without a key (or if DeepL fails) Groq translates.
+public static class Translator {
+	public static bool IsRussian(string text) {
+		int cyrillic = 0, latin = 0;
+		foreach (var c in text) {
+			if (c >= 'Ѐ' && c <= 'ӿ') ++cyrillic;
+			else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) ++latin;
+		}
+		return cyrillic > 0 && cyrillic >= latin;
+	}
+
+	public static Answer Translate(Config config, string text, out bool toEnglish) {
+		toEnglish = IsRussian(text);
+		Answer deepl = null;
+		if (!string.IsNullOrEmpty(config.DeepLKey)) {
+			deepl = DeepL(config.DeepLKey, text, toEnglish ? config.TranslateToEn : config.TranslateToRu);
+			if (deepl.Error.Length == 0) return deepl;
+			Log.Write("translate: " + deepl.Error + ", Groq instead");
+		}
+		if (string.IsNullOrEmpty(config.Key)) {
+			return deepl ?? new Answer { Error = "нет ключа DeepL (deepl_key в настройках)" };
+		}
+		var prompt = "Translate the text between <text> tags into " + (toEnglish ? "natural, fluent English" : "natural, fluent Russian")
+			+ ". Keep the meaning, tone, slang, swearing, names, emoji, links and line breaks. "
+			+ "Output only the translation, no quotes, no notes, no tags.\n\n<text>\n" + text + "\n</text>";
+		Engines.EffortOverride = "low";
+		try {
+			var answer = Engines.AskChat(config, config.Model, prompt);
+			if (answer.Error.Length == 0) {
+				answer.Text = Regex.Replace(answer.Text, "^\\s*<text>\\s*|\\s*</text>\\s*$", "");
+				answer.Engine = "Groq";
+			} else if (deepl != null) {
+				answer.Error = deepl.Error + "; " + answer.Error;
+			}
+			return answer;
+		} finally {
+			Engines.EffortOverride = null;
+		}
+	}
+
+	static Answer DeepL(string key, string text, string target) {
+		var answer = new Answer { Engine = "DeepL" };
+		try {
+			Engines.TuneNet();
+			var host = key.EndsWith(":fx") ? "https://api-free.deepl.com" : "https://api.deepl.com";
+			var request = (HttpWebRequest)WebRequest.Create(host + "/v2/translate");
+			request.Method = "POST";
+			request.ContentType = "application/json";
+			request.Headers["Authorization"] = "DeepL-Auth-Key " + key;
+			request.Timeout = 20000;
+			request.ReadWriteTimeout = 20000;
+			var body = new Dictionary<string, object> { { "text", new[] { text } }, { "target_lang", target } };
+			var bytes = Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(body));
+			using (var stream = request.GetRequestStream()) stream.Write(bytes, 0, bytes.Length);
+			int status;
+			string reply;
+			try {
+				using (var response = (HttpWebResponse)request.GetResponse())
+				using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8)) {
+					status = (int)response.StatusCode;
+					reply = reader.ReadToEnd();
+				}
+			} catch (WebException e) {
+				var response = e.Response as HttpWebResponse;
+				if (response == null) throw;
+				status = (int)response.StatusCode;
+				using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8)) reply = reader.ReadToEnd();
+			}
+			if (status == 200) {
+				var json = new JavaScriptSerializer().DeserializeObject(reply) as Dictionary<string, object>;
+				var list = json != null && json.ContainsKey("translations") ? json["translations"] as object[] : null;
+				var first = list != null && list.Length > 0 ? list[0] as Dictionary<string, object> : null;
+				if (first != null && first["text"] is string) {
+					answer.Text = ((string)first["text"]).Trim();
+					return answer;
+				}
+			}
+			answer.Error = status == 403 ? "DeepL: ключ не подходит" : status == 456 ? "DeepL: лимит месяца кончился" : "DeepL: ошибка " + status;
+		} catch (Exception e) {
+			answer.Error = "DeepL: нет сети (" + e.Message + ")";
+		}
+		return answer;
+	}
+}
+
 public static class Glass {
 	[StructLayout(LayoutKind.Sequential)] struct SIZE { public int cx, cy; }
 	[StructLayout(LayoutKind.Sequential)] struct POINT { public int x, y; }
@@ -2443,6 +2546,22 @@ public static class Glass {
 		p.Dispose();
 	}
 
+	// Translate: «A» and «я» side by side, the «я» in the violet accent.
+	public static void Letters(Graphics g, float cx, float cy, float s, Color color) {
+		using (var font = new Font("Segoe UI", s * 0.52f, FontStyle.Bold, GraphicsUnit.Pixel))
+		using (var white = new SolidBrush(color))
+		using (var accent = new SolidBrush(Accent1)) {
+			var format = StringFormat.GenericTypographic;
+			var a = g.MeasureString("A", font, 100, format);
+			var ya = g.MeasureString("я", font, 100, format);
+			var gap = -s * 0.03f;
+			var left = cx - (a.Width + gap + ya.Width) / 2f;
+			var top = cy - a.Height / 2f;
+			g.DrawString("A", font, white, left, top - s * 0.04f, format);
+			g.DrawString("я", font, accent, left + a.Width + gap, top + s * 0.06f, format);
+		}
+	}
+
 	// Microphone: capsule, cradle arc and stem.
 	public static void Mic(Graphics g, float cx, float cy, float s, Color color) {
 		var w = s * 0.20f;
@@ -2535,8 +2654,26 @@ public class SparkButton : Form {
 		DoubleBuffered = true;
 		Cursor = Cursors.Hand;
 		Size = new Size(38, 38);
-		var tip = new ToolTip();
+		var tip = _tip = new ToolTip();
 		tip.SetToolTip(this, "\u2728 Оформить красиво (Codex)  Ctrl+Shift+F\nЗажми и тащи, чтобы переставить");
+	}
+
+	ToolTip _tip;
+
+	public void SetTip(string text) {
+		_tip.SetToolTip(this, text);
+	}
+
+	// Placed from the top right of the client (the «Aя» button in the title strip).
+	public void PlaceTop(Rectangle client, float scale, int right, int top) {
+		if (_dragging) return;
+		_scale = scale;
+		var size = (int)Math.Round(EnterToggle.ButtonSize * scale);
+		var location = new Point(
+			client.Right - (int)Math.Round(right * scale) - size,
+			client.Top + (int)Math.Round(top * scale));
+		if (Size.Width != size) Size = new Size(size, size);
+		if (Location != location) Location = location;
 	}
 
 	protected override bool ShowWithoutActivation {
@@ -2607,6 +2744,7 @@ public class SparkButton : Form {
 			float cx = w / 2f, cy = h / 2f, size = h;
 			if (_recording) Glass.Stop(g, cx, cy, size, Color.White);
 			else if (_busy) Glass.Dots(g, cx, cy, size, Color.FromArgb(220, 220, 235));
+			else if (Glyph == "translate") Glass.Letters(g, cx, cy, size, Color.FromArgb(236, 236, 246));
 			else if (mic) Glass.Mic(g, cx, cy + size * 0.02f, size, Color.FromArgb(236, 236, 246));
 			else Glass.Sparkle(g, cx, cy, size, Color.White);
 		});
@@ -2895,6 +3033,8 @@ public class TrayApp : ApplicationContext {
 	readonly Dictionary<uint, string> _names = new Dictionary<uint, string>();
 	readonly SparkButton _button;
 	readonly SparkButton _mic;
+	readonly SparkButton _translate;
+	int _translating;
 	volatile bool _recording;
 	int _transcribing;
 	IntPtr _micWindow;
@@ -2946,6 +3086,9 @@ public class TrayApp : ApplicationContext {
 		_tray.ContextMenuStrip.Items.Add("Кнопки и пилюлю на место", null, (s, e) => {
 			SaveButtonPlace(14, 145);
 		});
+		var translateItem = new ToolStripMenuItem("Aя Кнопка перевода (DeepL)") { CheckOnClick = true, Checked = Config.Load().Translate };
+		translateItem.CheckedChanged += (s, e) => SaveSetting("translate", translateItem.Checked);
+		_tray.ContextMenuStrip.Items.Add(translateItem);
 		_tray.ContextMenuStrip.Items.Add("Лог", null, (s, e) => OpenFile("ayu_fancy.log"));
 		_tray.ContextMenuStrip.Items.Add("Выход", null, (s, e) => ExitThread());
 		_button = new SparkButton();
@@ -2956,6 +3099,16 @@ public class TrayApp : ApplicationContext {
 		_mic.Moved = (right, bottom) => SaveButtonPlace(right - EnterToggle.GroupStep, bottom);
 		_button.Clicked = () => StartRun(_target, Trigger.Button);
 		_button.Moved = SaveButtonPlace;
+		_translate = new SparkButton { Glyph = "translate" };
+		_translate.SetTip("Aя Перевод (DeepL): текст в поле RU→EN, иначе →RU\nВыдели сообщение — переведу его, пустое поле — то, что скопировал\nЗажми и тащи, чтобы переставить");
+		_translate.Clicked = () => StartTranslate(_target);
+		_translate.Moved = (right, bottom) => {
+			var c = _translate.Client;
+			var scale = _translate.Width / (float)EnterToggle.ButtonSize;
+			if (scale <= 0) return;
+			SaveSetting("translate_right", (int)Math.Round((c.Right - _translate.Right) / scale));
+			SaveSetting("translate_top", (int)Math.Round((_translate.Top - c.Top) / scale));
+		};
 		// The pill is the one master switch (ayu-fancy-pill-master-v1).
 		_toggle = new EnterToggle { On = _master.Checked };
 		_toggle.Clicked = TogglePill;
@@ -3279,7 +3432,7 @@ public class TrayApp : ApplicationContext {
 		var config = _cfg;
 		if (config == null) return;
 		var foreground = Native.GetForegroundWindow();
-		if (foreground == _button.Handle || foreground == _mic.Handle || foreground == _toggle.Handle || _button.Dragging || _mic.Dragging || _toggle.Dragging) {
+		if (foreground == _button.Handle || foreground == _mic.Handle || foreground == _toggle.Handle || _button.Dragging || _mic.Dragging || _toggle.Dragging || foreground == _translate.Handle || _translate.Dragging) {
 			return;
 		}
 		var window = foreground != IntPtr.Zero ? Native.GetAncestor(foreground, 2) : IntPtr.Zero; // GA_ROOT
@@ -3301,6 +3454,7 @@ public class TrayApp : ApplicationContext {
 			if (_button.Visible && _busy == 0) _button.Hide();
 			if (_mic.Visible) _mic.Hide(); // красная кнопка записи не торчит поверх чужих окон
 			if (_toggle.Visible) _toggle.Hide();
+			if (_translate.Visible && _translating == 0) _translate.Hide();
 			return;
 		}
 		Native.RECT rect;
@@ -3309,6 +3463,7 @@ public class TrayApp : ApplicationContext {
 			if (_button.Visible) _button.Hide();
 			if (_mic.Visible) _mic.Hide(); // красная кнопка записи не торчит поверх чужих окон
 			if (_toggle.Visible) _toggle.Hide();
+			if (_translate.Visible && _translating == 0) _translate.Hide();
 			return;
 		}
 		var origin = new Point(0, 0);
@@ -3321,6 +3476,16 @@ public class TrayApp : ApplicationContext {
 		} catch {
 		}
 		_target = window;
+		// «Aя» in the title strip, left of minimize; there even when AyuFancy is off
+		if (config.Translate) {
+			_translate.Client = client;
+			var tRight = Math.Max(0, Math.Min(config.TranslateRight, (int)(rect.Right / scale) - EnterToggle.ButtonSize));
+			var tTop = Math.Max(0, Math.Min(config.TranslateTop, (int)(rect.Bottom / scale) - EnterToggle.ButtonSize));
+			_translate.PlaceTop(client, scale, tRight, tTop);
+			if (!_translate.Visible) _translate.Show();
+		} else if (_translate.Visible && _translating == 0) {
+			_translate.Hide();
+		}
 		var right = config.ButtonRight;
 		var bottom = config.ButtonBottom;
 		// VoiceType pill sits right of ✨; dragging it drags the whole block
@@ -3672,6 +3837,97 @@ public class TrayApp : ApplicationContext {
 			}
 			Interlocked.Exchange(ref _busy, 0);
 			SetBusy(false);
+		}
+	}
+
+	void StartTranslate(IntPtr window) {
+		if (window == IntPtr.Zero || Interlocked.CompareExchange(ref _translating, 1, 0) != 0) return;
+		_translate.Busy = true;
+		var thread = new Thread(() => TranslateRun(window));
+		thread.SetApartmentState(ApartmentState.STA);
+		thread.IsBackground = true;
+		thread.Start();
+	}
+
+	// «Aя» click: a selection inside the message field is replaced by its
+	// translation; the whole field is translated in place; a selected chat
+	// message, or (empty field) the last copied text, is shown with the
+	// translation put on the clipboard. Ctrl+Z in the field undoes.
+	void TranslateRun(IntPtr window) {
+		string saved = null;
+		var restore = true;
+		try {
+			if (Native.GetForegroundWindow() != window) {
+				Native.SetForegroundWindow(window);
+				Thread.Sleep(80);
+			}
+			saved = Retry<string>(() => Clipboard.ContainsText() ? Clipboard.GetText() : null, null);
+			int pid;
+			IsAppWindow(window, out pid);
+			var field = FieldReader.Read(pid);
+			var selected = CopyFromField(false);
+			string text;
+			var inField = false;
+			var selectAll = false;
+			if (selected != null && selected.Text.Trim().Length > 0) {
+				text = selected.Text;
+				inField = field != null && field.Contains(text.Trim());
+			} else if (!string.IsNullOrWhiteSpace(field)) {
+				text = field;
+				inField = selectAll = true;
+			} else if (field == null && (selected = CopyFromField(true)) != null && selected.Text.Trim().Length > 0) {
+				text = selected.Text; // field not readable through UI Automation
+				inField = selectAll = true;
+			} else if (!string.IsNullOrWhiteSpace(saved)) {
+				text = saved;
+			} else {
+				Show("Aя Напиши текст, выдели сообщение или скопируй текст", window, 3000);
+				return;
+			}
+			text = text.Trim();
+			Show("Aя Перевожу…", window, 0);
+			var started = DateTime.Now;
+			bool toEnglish;
+			var answer = Translator.Translate(Config.Load(), text, out toEnglish);
+			var seconds = (DateTime.Now - started).TotalSeconds;
+			Log.Write("translate " + text.Length + " chars → " + (toEnglish ? "EN" : "RU") + " via " + answer.Engine + " " + seconds.ToString("0.0") + " s" + (answer.Error.Length > 0 ? ": " + answer.Error : ""));
+			if (answer.Error.Length > 0) {
+				Show("Aя " + answer.Error, window, 6000);
+				return;
+			}
+			var label = string.Format("Aя → {0} ({1}, {2:0.0} с)", toEnglish ? "EN" : "RU", answer.Engine, seconds);
+			if (inField && Native.GetForegroundWindow() == window) {
+				var now = FieldReader.Read(pid);
+				if (field == null || now == field) {
+					WriteClipboard(new Tagged(answer.Text, null));
+					if (selectAll) {
+						Native.Press(Native.VK_CONTROL, 'A');
+						Thread.Sleep(50);
+					}
+					Native.Press(Native.VK_CONTROL, 'V');
+					restore = false;
+					Thread.Sleep(300);
+					Show(label + ". Ctrl+Z вернёт как было", window, 3500);
+					return;
+				}
+			}
+			WriteClipboard(new Tagged(answer.Text, null));
+			restore = false;
+			var shown = answer.Text.Length > 900 ? answer.Text.Substring(0, 900) + "…" : answer.Text;
+			Show(label + " · в буфере, Ctrl+V\n\n" + shown, window, Math.Min(30000, 6000 + answer.Text.Length * 60));
+		} catch (Exception e) {
+			Log.Write("translate failed: " + e);
+			Show("Aя Ошибка: " + e.Message, window, 5000);
+		} finally {
+			if (restore) {
+				var text = saved;
+				RetryDo(() => {
+					if (text != null) Clipboard.SetText(text);
+					else Clipboard.Clear();
+				});
+			}
+			Interlocked.Exchange(ref _translating, 0);
+			try { _translate.BeginInvoke(new Action(() => _translate.Busy = false)); } catch { }
 		}
 	}
 
@@ -4152,6 +4408,12 @@ public static class Program {
 		if (args.Length == 3 && args[0] == "--livetest") return LiveTest(args[1], args[2]);
 		if (args.Length == 3 && args[0] == "--selftest") {
 			return SelfTest(args[1], args[2]);
+		}
+		if (args.Length == 3 && args[0] == "--translatetest") { // in.txt out.txt, no keys pressed
+			bool toEnglish;
+			var answer = Translator.Translate(Config.Load(), File.ReadAllText(args[1], Encoding.UTF8).Trim(), out toEnglish);
+			File.WriteAllText(args[2], "to: " + (toEnglish ? "EN" : "RU") + "\nengine: " + answer.Engine + "\nerror: " + answer.Error + "\ntext: " + answer.Text + "\n", new UTF8Encoding(false));
+			return answer.Error.Length == 0 ? 0 : 1;
 		}
 		if (args.Length == 2 && args[0] == "--whisper-test") {
 			var answer = Whisper.Transcribe(Config.Load(), Recorder.SilenceWav());
